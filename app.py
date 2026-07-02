@@ -1,13 +1,12 @@
-"""Ponto de entrada da aplicação TEDVHS Studio."""
+"""Aplicação principal TEDVHS Studio."""
 
 import sys
 import logging
 from typing import NoReturn
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QIcon
 
-from config import APP_TITLE, DEBUG, WINDOW_WIDTH, WINDOW_HEIGHT
+from config import APP_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT
 from core.logger import setup_logger
 from core.database.connection import DatabaseConnection
 from core.database.migrations import run_migrations
