@@ -1,0 +1,1 @@
+"""Shared module - Shared utilities, constants, and base classes."""
