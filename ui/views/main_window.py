@@ -51,6 +51,7 @@ class MainWindow(QMainWindow):
         self.repository: Optional[SQLiteMediaRepository] = None
         self.orchestrator: Optional[ImportOrchestrator] = None
         self.event_bus: Optional[EventBus] = None
+        self.config_service: Optional[ConfigurationService] = None
         self.media_library_view: Optional[MediaLibraryView] = None
         
         # Inicializar controller
@@ -90,17 +91,17 @@ class MainWindow(QMainWindow):
             self.event_bus = EventBus()
             
             # Configuração e pipeline de mídia
-            config_service = ConfigurationService()
-            media_scanner = MediaScanner(config_service)
+            self.config_service = ConfigurationService()
+            media_scanner = MediaScanner(self.config_service)
             media_validator = MediaValidator()
-            media_analyzer = FFprobeAnalyzer(config_service)
+            media_analyzer = FFprobeAnalyzer(self.config_service)
             self.media_pipeline = MediaPipeline(
                 scanner=media_scanner,
                 validator=media_validator,
                 analyzer=media_analyzer,
                 repository=self.repository,
                 event_bus=self.event_bus,
-                config=config_service,
+                config=self.config_service,
             )
             
             # ImportOrchestrator

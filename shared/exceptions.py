@@ -9,19 +9,19 @@ class ValidationException(MediaException):
     """Lançada quando validações de domínio falham."""
 
 
-class MediaProcessingException(MediaException):
+class ProcessingException(MediaException):
     """Lançada quando ocorre falha no processamento de mídia."""
 
 
-class ProcessingException(MediaProcessingException):
-    """Alias semântico para erros de processamento no pipeline."""
+class MediaProcessingException(ProcessingException):
+    """Alias semântico para compatibilidade com código legado."""
 
 
-class DuplicateException(MediaProcessingException):
+class DuplicateException(ProcessingException):
     """Lançada quando um arquivo duplicado é detectado."""
 
 
-class StateTransitionException(MediaProcessingException):
+class StateTransitionException(ProcessingException):
     """Lançada quando uma transição de estado é inválida."""
 
 
@@ -29,13 +29,13 @@ class InvalidStateTransitionException(StateTransitionException):
     """Nome legado mantido por compatibilidade."""
 
 
-class MetadataException(MediaProcessingException):
+class MetadataException(ProcessingException):
     """Lançada quando extração de metadados falha."""
 
 
-class RepositoryException(MediaProcessingException):
+class RepositoryException(ProcessingException):
     """Lançada em falhas de persistência."""
 
 
-class HashCalculationException(MediaProcessingException):
+class HashCalculationException(ProcessingException):
     """Lançada quando cálculo de hash falha."""
