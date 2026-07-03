@@ -1,8 +1,10 @@
-"""Persistence infrastructure module."""
+"""Camada de persistência do TEDVHS Studio.
 
-from infrastructure.persistence.repositories import Repository, IRepository
+Implementações de repositórios e acesso a dados.
+"""
+
+from infrastructure.persistence.sqlite_media_repository import SQLiteMediaRepository
 
 __all__ = [
-    'Repository',
-    'IRepository',
+    'SQLiteMediaRepository',
 ]
