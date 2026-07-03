@@ -21,7 +21,11 @@ from application.media.import_orchestrator import ImportOrchestrator
 from application.task_management import TaskScheduler, TaskQueue
 from infrastructure.persistence.sqlite_media_repository import SQLiteMediaRepository
 from application.media.media_pipeline import MediaPipeline
-from application.shared.event_bus import EventBus
+from application.event_bus import EventBus
+from infrastructure.config.configuration_service import ConfigurationService
+from infrastructure.media.media_scanner import MediaScanner
+from infrastructure.media.media_validator import MediaValidator
+from infrastructure.media.media_analyzer import FFprobeAnalyzer
 from presentation.views.media_library_view import MediaLibraryView
 
 
@@ -47,6 +51,7 @@ class MainWindow(QMainWindow):
         self.repository: Optional[SQLiteMediaRepository] = None
         self.orchestrator: Optional[ImportOrchestrator] = None
         self.event_bus: Optional[EventBus] = None
+        self.config_service: Optional[ConfigurationService] = None
         self.media_library_view: Optional[MediaLibraryView] = None
         
         # Inicializar controller
@@ -85,8 +90,19 @@ class MainWindow(QMainWindow):
             # Event Bus
             self.event_bus = EventBus()
             
-            # Media Pipeline (mock para desenvolvimento)
-            self.media_pipeline = MediaPipeline()
+            # Configuração e pipeline de mídia
+            self.config_service = ConfigurationService()
+            media_scanner = MediaScanner(self.config_service)
+            media_validator = MediaValidator()
+            media_analyzer = FFprobeAnalyzer(self.config_service)
+            self.media_pipeline = MediaPipeline(
+                scanner=media_scanner,
+                validator=media_validator,
+                analyzer=media_analyzer,
+                repository=self.repository,
+                event_bus=self.event_bus,
+                config=self.config_service,
+            )
             
             # ImportOrchestrator
             self.orchestrator = ImportOrchestrator(
@@ -189,13 +205,17 @@ class MainWindow(QMainWindow):
                 self.orchestrator.current_session_id
             )
             if progress:
+                status = progress.get("status", "IN_PROGRESS")
+                stage = progress.get("stage") or status
                 status_text = (
-                    f"Importação: {progress['total_files_imported']}/{progress['total_files_found']} "
-                    f"({progress['percentage']}%) | Falhas: {progress['total_files_failed']}"
+                    f"{stage}: {progress.get('percentage', 0)}% | "
+                    f"Importados: {progress.get('total_files_imported', 0)} | "
+                    f"Duplicados: {progress.get('total_files_duplicate', 0)} | "
+                    f"Falhas: {progress.get('total_files_failed', 0)}"
                 )
                 self.status_label.setText(status_text)
-        else:
-            self.status_label.setText("Pronto")
+                return
+        self.status_label.setText("Pronto")
     
     def _on_import_library(self) -> None:
         """Abre dialog de importação de biblioteca."""

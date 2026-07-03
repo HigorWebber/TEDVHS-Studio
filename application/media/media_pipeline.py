@@ -5,63 +5,56 @@ Scanning -> Validation -> Hashing -> Analysis -> Persistence -> Events
 """
 
 import logging
-from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from uuid import uuid4
 
-from domain.media.media_file import MediaFile, FileInfo, VideoInfo, AudioInfo, ProcessingInfo, HashInfo
-from domain.media.processing_status import ProcessingStatus
-from domain.media.value_objects import FileHash, FileSize, Duration, MediaId
+from application.event_bus import EventBus
 from domain.media.events import (
-    MediaDiscoveredEvent, MediaValidatedEvent, MetadataExtractedEvent,
-    DuplicateDetectedEvent, MediaImportedEvent, StateTransitionEvent,
-    ProcessingFailedEvent, ImportStartedEvent, ImportCompletedEvent
+    DuplicateDetectedEvent,
+    ImportCompletedEvent,
+    ImportStartedEvent,
+    MediaDiscoveredEvent,
+    MediaImportedEvent,
+    MediaValidatedEvent,
+    MetadataExtractedEvent,
 )
 from domain.media.exceptions import ProcessingException
+from domain.media.media_file import (
+    AudioInfo,
+    FileInfo,
+    HashInfo,
+    MediaFile,
+    ProcessingInfo,
+    VideoInfo,
+)
 from domain.media.media_state_machine import MediaStateMachine
-
-from infrastructure.media.media_scanner import MediaScanner, MediaFileCandidate
-from infrastructure.media.media_validator import MediaValidator
+from domain.media.processing_status import ProcessingStatus
+from domain.media.value_objects import FileSize
+from infrastructure.config.configuration_service import ConfigurationService
 from infrastructure.media.hash_calculator import HashCalculator
 from infrastructure.media.media_analyzer import FFprobeAnalyzer
 from infrastructure.media.media_repository import IMediaRepository
-
-from application.shared.event_bus import EventBus
-from infrastructure.config.configuration_service import ConfigurationService
+from infrastructure.media.media_scanner import MediaFileCandidate, MediaScanner
+from infrastructure.media.media_validator import MediaValidator
 
 
 logger = logging.getLogger(__name__)
 
 
 class MediaPipeline:
-    """Orchestrates media file import processing.
-    
-    Coordinates all stages:
-    1. Scanner - discovers files
-    2. Validator - validates candidates
-    3. HashCalculator - computes SHA-256
-    4. Analyzer - extracts metadata
-    5. Repository - persists data
-    6. EventBus - emits events
-    """
-    
-    def __init__(self, 
-                 scanner: MediaScanner,
-                 validator: MediaValidator,
-                 analyzer: FFprobeAnalyzer,
-                 repository: IMediaRepository,
-                 event_bus: EventBus,
-                 config: ConfigurationService):
-        """Initialize pipeline.
-        
-        Args:
-            scanner: Media scanner
-            validator: Media validator
-            analyzer: Metadata analyzer
-            repository: Media repository
-            event_bus: Event bus for emission
-            config: Configuration service
-        """
+    """Orquestra o processamento de importação de arquivos de mídia."""
+
+    def __init__(
+        self,
+        scanner: MediaScanner,
+        validator: MediaValidator,
+        analyzer: FFprobeAnalyzer,
+        repository: IMediaRepository,
+        event_bus: EventBus,
+        config: ConfigurationService,
+    ):
         self._scanner = scanner
         self._validator = validator
         self._analyzer = analyzer
@@ -70,29 +63,84 @@ class MediaPipeline:
         self._config = config
         self._state_machine = MediaStateMachine()
         logger.info("MediaPipeline initialized")
-    
-    def process_directory(self, root_path: str,
-                         progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
-        """Process entire directory for import.
-        
-        Args:
-            root_path: Root directory to scan
-            progress_callback: Optional progress callback
-            
-        Returns:
-            Import summary with statistics
-        """
-        import_session_id = str(uuid4())
+
+    def process_directory(
+        self,
+        root_path: str,
+        import_session_id: Optional[str] = None,
+        progress_callback: Optional[Callable] = None,
+        cancel_checker: Optional[Callable[[], bool]] = None,
+        pause_callback: Optional[Callable[[], None]] = None,
+    ) -> Dict[str, Any]:
+        """Processar uma pasta inteira para importação."""
+        session_id = import_session_id or str(uuid4())
+        return self._process_import(
+            source_label=str(root_path),
+            import_session_id=session_id,
+            candidates_provider=lambda: self._scanner.scan(root_path),
+            progress_callback=progress_callback,
+            cancel_checker=cancel_checker,
+            pause_callback=pause_callback,
+        )
+
+    def process_files(
+        self,
+        file_paths: Iterable[str],
+        import_session_id: Optional[str] = None,
+        progress_callback: Optional[Callable] = None,
+        cancel_checker: Optional[Callable[[], bool]] = None,
+        pause_callback: Optional[Callable[[], None]] = None,
+    ) -> Dict[str, Any]:
+        """Processar arquivos selecionados individualmente."""
+        paths = [str(path) for path in file_paths]
+        session_id = import_session_id or str(uuid4())
+        return self._process_import(
+            source_label=f"{len(paths)} arquivo(s) selecionado(s)",
+            import_session_id=session_id,
+            candidates_provider=lambda: self._build_candidates_from_files(paths),
+            progress_callback=progress_callback,
+            cancel_checker=cancel_checker,
+            pause_callback=pause_callback,
+        )
+
+    def _build_candidates_from_files(self, file_paths: Iterable[str]) -> List[MediaFileCandidate]:
+        """Criar candidatos a partir de arquivos escolhidos na interface."""
+        candidates: List[MediaFileCandidate] = []
+        for raw_path in file_paths:
+            path = Path(raw_path)
+            if not path.exists() or not path.is_file():
+                logger.warning("Arquivo selecionado inválido ignorado: %s", raw_path)
+                continue
+
+            try:
+                candidate = self._scanner._check_file(path)  # compatibilidade com scanner existente
+            except Exception as exc:
+                logger.warning("Erro ao avaliar arquivo %s: %s", raw_path, exc)
+                candidate = None
+
+            if candidate:
+                candidates.append(candidate)
+            else:
+                logger.info("Arquivo selecionado não suportado/ignorado: %s", raw_path)
+        return candidates
+
+    def _process_import(
+        self,
+        source_label: str,
+        import_session_id: str,
+        candidates_provider: Callable[[], List[MediaFileCandidate]],
+        progress_callback: Optional[Callable] = None,
+        cancel_checker: Optional[Callable[[], bool]] = None,
+        pause_callback: Optional[Callable[[], None]] = None,
+    ) -> Dict[str, Any]:
         start_time = datetime.utcnow()
-        
-        logger.info(f"Starting import session: {import_session_id}")
+        logger.info("Starting import session: %s", import_session_id)
         self._event_bus.emit(ImportStartedEvent(
             import_session_id=import_session_id,
-            folder_path=root_path
+            folder_path=source_label,
         ))
-        
-        # Statistics
-        stats = {
+
+        stats: Dict[str, Any] = {
             "import_session_id": import_session_id,
             "folders_scanned": 0,
             "files_found": 0,
@@ -102,122 +150,195 @@ class MediaPipeline:
             "files_failed": 0,
             "total_size_bytes": 0,
             "total_duration_seconds": 0,
+            "cancelled": False,
         }
-        
+
+        def emit_progress(stage: str, current: int = 0, total: int = 0,
+                          current_file: Optional[str] = None) -> None:
+            if not progress_callback:
+                return
+            try:
+                progress_callback(stage, current, total, dict(stats), current_file)
+            except TypeError:
+                progress_callback(stage, current, total)
+
+        def should_cancel() -> bool:
+            return bool(cancel_checker and cancel_checker())
+
         try:
-            # Stage 1: Scanning
-            logger.info("Stage 1: Scanning directory...")
-            candidates = self._scanner.scan(root_path)
+            emit_progress("Localizando arquivos", 0, 0)
+
+            candidates = candidates_provider()
             stats["files_found"] = len(candidates)
-            stats["folders_scanned"] = 1  # Simplified for now
-            
-            if progress_callback:
-                progress_callback("scanning", len(candidates))
-            
-            # Stage 2: Validation
-            logger.info("Stage 2: Validating files...")
+            stats["folders_scanned"] = 1
+            emit_progress("Arquivos encontrados", len(candidates), len(candidates))
+
+            if should_cancel():
+                stats["cancelled"] = True
+                return self._finalize_stats(stats, start_time, emit_progress)
+
             valid_candidates, failed = self._validator.validate_batch(candidates)
             stats["files_valid"] = len(valid_candidates)
             stats["files_failed"] = len(failed)
-            
-            if progress_callback:
-                progress_callback("validating", len(valid_candidates))
-            
-            # Stage 3-6: Process each valid file
-            logger.info(f"Stage 3-6: Processing {len(valid_candidates)} files...")
-            for i, candidate in enumerate(valid_candidates):
+            emit_progress("Arquivos validados", len(valid_candidates), len(candidates))
+
+            logger.info("Processing %s valid media files", len(valid_candidates))
+            total_to_process = len(valid_candidates)
+
+            for index, candidate in enumerate(valid_candidates, start=1):
+                if pause_callback:
+                    pause_callback()
+
+                if should_cancel():
+                    stats["cancelled"] = True
+                    break
+
+                emit_progress(
+                    "Processando arquivo",
+                    index - 1,
+                    total_to_process,
+                    candidate.file_name,
+                )
+
                 try:
                     media = self._process_candidate(candidate)
-                    stats["files_imported"] += 1
-                    stats["total_size_bytes"] += candidate.file_size
-                    if media.video_info.duration:
-                        stats["total_duration_seconds"] += media.video_info.duration.seconds
-                
-                except ProcessingException as e:
-                    logger.error(f"Failed to process {candidate.file_path}: {e}")
+                    if media is None:
+                        stats["files_duplicate"] += 1
+                    else:
+                        stats["files_imported"] += 1
+                        stats["total_size_bytes"] += candidate.file_size
+                        if media.video_info.duration:
+                            stats["total_duration_seconds"] += media.video_info.duration.seconds
+
+                except ProcessingException as exc:
+                    logger.error("Failed to process %s: %s", candidate.file_path, exc)
                     stats["files_failed"] += 1
-                
-                if progress_callback:
-                    progress_callback("processing", i + 1, len(valid_candidates))
-            
-            # Duration
-            duration_seconds = (datetime.utcnow() - start_time).total_seconds()
-            
-            # Emit completion event
-            self._event_bus.emit(ImportCompletedEvent(
-                import_session_id=import_session_id,
-                total_files=stats["files_found"],
-                imported_files=stats["files_imported"],
-                duplicate_files=stats["files_duplicate"],
-                failed_files=stats["files_failed"],
-                total_size_bytes=stats["total_size_bytes"],
-                duration_seconds=duration_seconds
-            ))
-            
-            stats["duration_seconds"] = duration_seconds
-            
-            logger.info(f"Import session complete: {import_session_id}")
-            logger.info(f"Summary: {stats['files_imported']} imported, "
-                       f"{stats['files_duplicate']} duplicates, "
-                       f"{stats['files_failed']} failed")
-            
-            return stats
-        
-        except Exception as e:
-            logger.error(f"Import session failed: {e}")
+
+                emit_progress(
+                    "Processando arquivo",
+                    index,
+                    total_to_process,
+                    candidate.file_name,
+                )
+
+            return self._finalize_stats(stats, start_time, emit_progress)
+
+        except Exception as exc:
+            logger.error("Import session failed: %s", exc, exc_info=True)
             raise
-    
-    def _process_candidate(self, candidate: MediaFileCandidate) -> MediaFile:
-        """Process a single file candidate through pipeline.
-        
-        Args:
-            candidate: File candidate to process
-            
+
+    def _finalize_stats(
+        self,
+        stats: Dict[str, Any],
+        start_time: datetime,
+        emit_progress: Callable[[str, int, int, Optional[str]], None],
+    ) -> Dict[str, Any]:
+        duration_seconds = (datetime.utcnow() - start_time).total_seconds()
+        stats["duration_seconds"] = duration_seconds
+
+        total_processed = (
+            stats["files_imported"]
+            + stats["files_duplicate"]
+            + stats["files_failed"]
+        )
+        total_to_process = stats.get("files_valid") or stats.get("files_found") or 0
+
+        self._event_bus.emit(ImportCompletedEvent(
+            import_session_id=stats["import_session_id"],
+            total_files=stats["files_found"],
+            imported_files=stats["files_imported"],
+            duplicate_files=stats["files_duplicate"],
+            failed_files=stats["files_failed"],
+            total_size_bytes=stats["total_size_bytes"],
+            duration_seconds=duration_seconds,
+        ))
+
+        emit_progress(
+            "Cancelado" if stats.get("cancelled") else "Concluído",
+            total_processed,
+            total_to_process,
+            None,
+        )
+
+        logger.info(
+            "Import session complete: %s | imported=%s duplicate=%s failed=%s cancelled=%s",
+            stats["import_session_id"],
+            stats["files_imported"],
+            stats["files_duplicate"],
+            stats["files_failed"],
+            stats["cancelled"],
+        )
+        return stats
+
+    def _process_candidate(self, candidate: MediaFileCandidate) -> Optional[MediaFile]:
+        """Processar um arquivo individual.
+
         Returns:
-            Processed MediaFile
-            
-        Raises:
-            ProcessingException: If processing fails
+            MediaFile quando importado; None quando for duplicado/ignorado.
         """
         try:
-            # Emit discovery event
             self._event_bus.emit(MediaDiscoveredEvent(
-                file_hash="",  # Will be set after hashing
+                file_hash="",
                 file_path=str(candidate.file_path),
                 file_name=candidate.file_name,
-                file_size=candidate.file_size
+                file_size=candidate.file_size,
             ))
-            
-            # Calculate hash
+
             file_hash = HashCalculator.calculate(candidate.file_path)
-            
-            # Check for duplicates
-            existing = self._repository.find_by_hash(file_hash)
+
+            existing = self._repository.find_by_hash_in_location(file_hash)
             if existing:
                 self._event_bus.emit(DuplicateDetectedEvent(
                     file_hash=str(file_hash),
                     original_hash=str(existing.hash_info.file_hash),
-                    file_path=str(candidate.file_path)
+                    file_path=str(candidate.file_path),
                 ))
-                raise ProcessingException(f"Duplicate file: {file_hash}")
-            
-            # Validate again
+
+                duplicate_media = MediaFile(
+                    file_info=FileInfo(
+                        file_path=str(candidate.file_path),
+                        file_name=candidate.file_name,
+                        file_name_clean=candidate.file_path.stem,
+                        file_extension=candidate.file_extension,
+                        file_size=FileSize(candidate.file_size),
+                        file_modified_at=candidate.file_modified,
+                    ),
+                    video_info=existing.video_info,
+                    audio_info=existing.audio_info,
+                    processing_info=ProcessingInfo(
+                        status=ProcessingStatus.SKIPPED,
+                        last_error="Arquivo ignorado por ser duplicado",
+                    ),
+                    hash_info=HashInfo(
+                        file_hash=file_hash,
+                        is_duplicate=True,
+                        duplicate_of_hash=existing.hash_info.file_hash,
+                    ),
+                )
+
+                try:
+                    self._repository.add(duplicate_media)
+                except Exception as exc:
+                    # Mesmo caminho já registrado ou outro conflito: continua como duplicado contado.
+                    logger.info("Duplicado não registrado novamente: %s | %s", candidate.file_path, exc)
+
+                logger.info("Arquivo duplicado ignorado na mesma pasta/temporada: %s", candidate.file_path)
+                return None
+
             self._event_bus.emit(MediaValidatedEvent(
                 file_hash=str(file_hash),
-                file_path=str(candidate.file_path)
+                file_path=str(candidate.file_path),
             ))
-            
-            # Extract metadata
+
             metadata = self._analyzer.analyze(candidate.file_path, file_hash)
             self._event_bus.emit(MetadataExtractedEvent(
                 file_hash=str(file_hash),
                 duration=metadata["duration"].seconds,
                 fps=metadata.get("fps", 0),
                 resolution=str(metadata.get("resolution", "")),
-                codec_video=metadata.get("codec_video", "")
+                codec_video=metadata.get("codec_video", ""),
             ))
-            
-            # Create MediaFile entity
+
             media = MediaFile(
                 file_info=FileInfo(
                     file_path=str(candidate.file_path),
@@ -225,7 +346,7 @@ class MediaPipeline:
                     file_name_clean=candidate.file_path.stem,
                     file_extension=candidate.file_extension,
                     file_size=FileSize(candidate.file_size),
-                    file_modified_at=candidate.file_modified
+                    file_modified_at=candidate.file_modified,
                 ),
                 video_info=VideoInfo(
                     duration=metadata["duration"],
@@ -234,37 +355,31 @@ class MediaPipeline:
                     aspect_ratio=metadata.get("aspect_ratio"),
                     codec_video=metadata.get("codec_video", ""),
                     bitrate=metadata.get("bitrate", 0),
-                    num_streams=metadata.get("num_streams", 0)
+                    num_streams=metadata.get("num_streams", 0),
                 ),
                 audio_info=AudioInfo(
                     codec_audio=metadata.get("codec_audio"),
                     audio_channels=metadata.get("audio_channels", 0),
-                    language_code=metadata.get("language_code")
+                    language_code=metadata.get("language_code"),
                 ),
-                processing_info=ProcessingInfo(
-                    status=ProcessingStatus.METADATA_EXTRACTED
-                ),
-                hash_info=HashInfo(file_hash=file_hash)
+                processing_info=ProcessingInfo(status=ProcessingStatus.METADATA_EXTRACTED),
+                hash_info=HashInfo(file_hash=file_hash),
             )
-            
-            # Persist
+
             media = self._repository.add(media)
-            
-            # Update status
             media.processing_info.status = ProcessingStatus.READY
             self._repository.update(media)
-            
-            # Emit import event
+
             self._event_bus.emit(MediaImportedEvent(
                 media_id=media.id.value if media.id else 0,
                 file_hash=str(file_hash),
-                file_path=str(candidate.file_path)
+                file_path=str(candidate.file_path),
             ))
-            
-            logger.info(f"Media imported: {candidate.file_name}")
+
+            logger.info("Media imported: %s", candidate.file_name)
             return media
-        
+
         except ProcessingException:
             raise
-        except Exception as e:
-            raise ProcessingException(f"Error processing {candidate.file_path}: {e}")
+        except Exception as exc:
+            raise ProcessingException(f"Error processing {candidate.file_path}: {exc}")

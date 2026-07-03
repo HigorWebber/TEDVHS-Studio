@@ -1,10 +1,10 @@
-"""Event bus for system-wide event broadcasting."""
+"""Event bus para comunicação entre módulos do sistema."""
 
 import logging
-from typing import Callable, List, Dict, Optional, Any
-from datetime import datetime
 import threading
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
 
 from shared.types import EventType
 
@@ -14,111 +14,135 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Event:
-    """Represents a system event.
-    
-    Attributes:
-        event_type: Type of event
-        timestamp: When event occurred
-        source: Module that emitted event
-        data: Event-specific data
-    """
-    event_type: EventType
+    """Representa um evento do sistema."""
+
+    event_type: Any
     timestamp: datetime
     source: Optional[str] = None
     data: Optional[Dict[str, Any]] = None
 
 
 class EventBus:
-    """Central event publisher/subscriber system.
-    
-    Allows decoupled communication between modules through events.
+    """Barramento central de eventos.
+
+    Aceita eventos nos seguintes formatos:
+    - EventType
+    - objetos de evento de domínio
+    - dict com chave "type"
     """
-    
+
     def __init__(self):
-        """Initialize event bus."""
-        self.subscribers: Dict[EventType, List[Callable]] = {}
+        """Inicializa o EventBus."""
+        self.subscribers: Dict[Any, List[Callable]] = {}
         self.lock = threading.RLock()
-        logger.info("EventBus initialized")
-    
-    def subscribe(self, event_type: EventType, handler: Callable[[Event], None]) -> None:
-        """Subscribe to an event type.
-        
-        Args:
-            event_type: Type of event to listen for
-            handler: Callable to execute when event is emitted
-        """
+        logger.info("EventBus inicializado")
+
+    def _get_event_name(self, event_type: Any) -> str:
+        """Retorna um nome seguro para o evento."""
+        if isinstance(event_type, dict):
+            return str(event_type.get("type", "UNKNOWN_EVENT"))
+
+        if hasattr(event_type, "value"):
+            return str(event_type.value)
+
+        if hasattr(event_type, "event_type"):
+            return str(getattr(event_type, "event_type"))
+
+        if hasattr(event_type, "type"):
+            return str(getattr(event_type, "type"))
+
+        return event_type.__class__.__name__
+
+    def _get_subscriber_key(self, event_type: Any) -> Any:
+        """Retorna a chave usada para buscar subscribers."""
+        if isinstance(event_type, dict):
+            return event_type.get("type", "UNKNOWN_EVENT")
+
+        if hasattr(event_type, "value"):
+            return event_type
+
+        return event_type.__class__.__name__
+
+    def subscribe(self, event_type: Any, handler: Callable[[Event], None]) -> None:
+        """Inscreve um handler para um tipo de evento."""
+        key = self._get_subscriber_key(event_type)
+
         with self.lock:
-            if event_type not in self.subscribers:
-                self.subscribers[event_type] = []
-            
-            self.subscribers[event_type].append(handler)
-            logger.debug(f"Handler subscribed to {event_type.value}")
-    
-    def unsubscribe(self, event_type: EventType, handler: Callable[[Event], None]) -> None:
-        """Unsubscribe from an event type.
-        
-        Args:
-            event_type: Type of event
-            handler: Handler to remove
-        """
+            if key not in self.subscribers:
+                self.subscribers[key] = []
+
+            self.subscribers[key].append(handler)
+            logger.debug(f"Handler inscrito em {self._get_event_name(event_type)}")
+
+    def unsubscribe(self, event_type: Any, handler: Callable[[Event], None]) -> None:
+        """Remove inscrição de um handler."""
+        key = self._get_subscriber_key(event_type)
+
         with self.lock:
-            if event_type in self.subscribers:
+            if key in self.subscribers:
                 try:
-                    self.subscribers[event_type].remove(handler)
-                    logger.debug(f"Handler unsubscribed from {event_type.value}")
+                    self.subscribers[key].remove(handler)
+                    logger.debug(f"Handler removido de {self._get_event_name(event_type)}")
                 except ValueError:
-                    logger.warning(f"Handler not found for {event_type.value}")
-    
-    def emit(self, event_type: EventType, data: Optional[Dict[str, Any]] = None,
-             source: Optional[str] = None) -> None:
-        """Emit an event.
-        
-        Args:
-            event_type: Type of event
-            data: Event data
-            source: Source module name
+                    logger.warning(f"Handler não encontrado para {self._get_event_name(event_type)}")
+
+    def emit(
+        self,
+        event_type: Any,
+        data: Optional[Dict[str, Any]] = None,
+        source: Optional[str] = None
+    ) -> None:
+        """Emite um evento.
+
+        Suporta:
+        - EventType
+        - objeto de evento de domínio
+        - dict com chave "type"
         """
+        key = self._get_subscriber_key(event_type)
+        event_name = self._get_event_name(event_type)
+
+        if isinstance(event_type, dict):
+            event_data = dict(event_type)
+            if source is None:
+                source = event_type.get("source")
+        elif hasattr(event_type, "value"):
+            event_data = data or {}
+        else:
+            event_data = getattr(event_type, "__dict__", {"event": event_type})
+
         event = Event(
-            event_type=event_type,
+            event_type=key,
             timestamp=datetime.utcnow(),
             source=source,
-            data=data or {}
+            data=event_data or {}
         )
-        
-        logger.debug(f"Event emitted: {event_type.value} from {source}")
-        
+
+        logger.debug(f"Evento emitido: {event_name} from {source}")
+
         with self.lock:
-            handlers = self.subscribers.get(event_type, [])
-        
-        # Execute handlers in separate threads to avoid blocking
+            handlers = list(self.subscribers.get(key, []))
+
         for handler in handlers:
             try:
                 threading.Thread(target=handler, args=(event,), daemon=True).start()
             except Exception as e:
-                logger.error(f"Error executing event handler: {e}", exc_info=True)
-    
-    def get_subscriber_count(self, event_type: EventType) -> int:
-        """Get number of subscribers for an event type.
-        
-        Args:
-            event_type: Type of event
-            
-        Returns:
-            Number of subscribers
-        """
+                logger.error(f"Erro ao executar handler de evento: {e}", exc_info=True)
+
+    def get_subscriber_count(self, event_type: Any) -> int:
+        """Retorna quantidade de subscribers para um evento."""
+        key = self._get_subscriber_key(event_type)
+
         with self.lock:
-            return len(self.subscribers.get(event_type, []))
-    
-    def clear_subscribers(self, event_type: Optional[EventType] = None) -> None:
-        """Clear subscribers.
-        
-        Args:
-            event_type: Specific event type or None for all
-        """
+            return len(self.subscribers.get(key, []))
+
+    def clear_subscribers(self, event_type: Optional[Any] = None) -> None:
+        """Limpa subscribers."""
         with self.lock:
             if event_type:
-                self.subscribers.pop(event_type, None)
-                logger.debug(f"Cleared subscribers for {event_type.value}")
+                key = self._get_subscriber_key(event_type)
+                self.subscribers.pop(key, None)
+                logger.debug(f"Subscribers limpos para {self._get_event_name(event_type)}")
             else:
                 self.subscribers.clear()
-                logger.debug("Cleared all subscribers")
+                logger.debug("Todos os subscribers foram limpos")
