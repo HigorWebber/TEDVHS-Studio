@@ -1,112 +1,322 @@
 """Implementação de repository SQLite para Media Library Engine."""
 
 import logging
+import re
 import sqlite3
-from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from core.database.connection import DatabaseConnection
-from domain.media.media_file import MediaFile, FileInfo, VideoInfo, AudioInfo, ProcessingInfo, HashInfo
+from domain.media.media_file import (
+    AudioInfo,
+    FileInfo,
+    HashInfo,
+    MediaFile,
+    ProcessingInfo,
+    VideoInfo,
+)
 from domain.media.processing_status import ProcessingStatus
-from domain.media.value_objects import FileHash, MediaId, FileSize, Duration, Resolution
+from domain.media.value_objects import Duration, FileHash, FileSize, MediaId, Resolution
 
 
 logger = logging.getLogger(__name__)
 
 
 class SQLiteMediaRepository:
-    """Repository para persistência de MediaFile em SQLite.
-    
-    Implementa operações CRUD e queries otimizadas para Media Library Engine.
-    """
-    
+    """Repository para persistência de MediaFile em SQLite."""
+
     def __init__(self, db_connection: DatabaseConnection):
-        """Inicializar repository.
-        
-        Args:
-            db_connection: Conexão com banco de dados
-        """
         self.db = db_connection
+        self._active_session_id: Optional[str] = None
+        self._active_library_folder: str = "Sem pasta"
+        self._active_library_season: str = "Sem temporada"
         self._ensure_schema()
         logger.info("SQLiteMediaRepository inicializado")
-    
+
     def _ensure_schema(self) -> None:
-        """Garantir que o schema existe no banco de dados."""
+        """Garantir que o schema existe e aplicar migrações leves."""
         try:
-            # Verificar se tabelas existem
             cursor = self.db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='media_files'"
             )
             if cursor.fetchone() is None:
-                logger.info("Criando schema de media_files")
                 schema_path = Path(__file__).parent / "media_schema.sql"
                 if schema_path.exists():
-                    with open(schema_path, 'r') as f:
-                        sql = f.read()
-                    for statement in sql.split(';'):
+                    with open(schema_path, "r", encoding="utf-8") as file:
+                        sql = file.read()
+                    for statement in sql.split(";"):
                         if statement.strip():
                             self.db.execute(statement)
                     self.db.commit()
-                    logger.info("Schema criado com sucesso")
-        except Exception as e:
-            logger.error(f"Erro ao garantir schema: {e}", exc_info=True)
+                    logger.info("Schema de mídia criado com sucesso")
+
+            self._ensure_import_session_columns()
+            self._ensure_library_folder_schema()
+            self._migrate_media_files_uniqueness_if_needed()
+        except Exception as exc:
+            logger.error("Erro ao garantir schema: %s", exc, exc_info=True)
             raise
-    
+
+    def _ensure_import_session_columns(self) -> None:
+        """Adicionar colunas novas em bancos antigos."""
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(import_sessions)").fetchall()}
+        if "total_files_duplicate" not in columns:
+            self.db.execute(
+                "ALTER TABLE import_sessions ADD COLUMN total_files_duplicate INTEGER DEFAULT 0"
+            )
+            self.db.commit()
+
+    def _ensure_library_folder_schema(self) -> None:
+        """Criar estrutura simples de pastas e temporadas internas da biblioteca."""
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS media_folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS media_seasons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                folder_name TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(folder_name, name)
+            )"""
+        )
+
+        media_columns = {row[1] for row in self.db.execute("PRAGMA table_info(media_files)").fetchall()}
+        if media_columns and "library_folder" not in media_columns:
+            self.db.execute(
+                "ALTER TABLE media_files ADD COLUMN library_folder TEXT DEFAULT 'Sem pasta'"
+            )
+        if media_columns and "library_season" not in media_columns:
+            self.db.execute(
+                "ALTER TABLE media_files ADD COLUMN library_season TEXT DEFAULT 'Sem temporada'"
+            )
+
+        self.db.execute(
+            "INSERT OR IGNORE INTO media_folders (name) VALUES (?)",
+            ("Sem pasta",),
+        )
+        self.db.execute(
+            "INSERT OR IGNORE INTO media_seasons (folder_name, name) VALUES (?, ?)",
+            ("Sem pasta", "Sem temporada"),
+        )
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_library_folder ON media_files(library_folder)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_library_season ON media_files(library_season)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_library_folder_season ON media_files(library_folder, library_season)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_seasons_folder ON media_seasons(folder_name)")
+        self.db.commit()
+
+    def _migrate_media_files_uniqueness_if_needed(self) -> None:
+        """Remover UNIQUE global de hash/caminho e adicionar temporada em bancos antigos.
+
+        O mesmo vídeo pode aparecer em pastas/temporadas diferentes da biblioteca.
+        A detecção de duplicado passa a considerar a localização interna
+        (pasta + temporada), e não apenas o hash global ou o nome do arquivo.
+        """
+        row = self.db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='media_files'"
+        ).fetchone()
+        create_sql = row[0] if row else ""
+        normalized_sql = create_sql.upper().replace("  ", " ")
+        needs_migration = (
+            "FILE_HASH TEXT UNIQUE" in normalized_sql
+            or "FILE_PATH TEXT NOT NULL UNIQUE" in normalized_sql
+            or "LIBRARY_SEASON" not in normalized_sql
+        )
+        if not needs_migration:
+            return
+
+        logger.info("Migrando media_files para suportar pastas/temporadas e duplicados por localização")
+        backup_name = f"media_files_backup_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        self.db.execute(f"ALTER TABLE media_files RENAME TO {backup_name}")
+        self._create_media_files_table()
+
+        old_columns = {row[1] for row in self.db.execute(f"PRAGMA table_info({backup_name})").fetchall()}
+        target_columns = [
+            "id", "import_session_id", "file_path", "file_name", "file_extension",
+            "file_size_bytes", "file_hash", "is_duplicate", "duplicate_of_hash",
+            "duration_seconds", "fps", "width", "height", "resolution", "codec_video",
+            "codec_audio", "audio_channels", "status", "import_date", "metadata_version",
+            "processing_attempts", "last_error", "library_folder", "library_season",
+        ]
+        defaults = {
+            "is_duplicate": "0",
+            "metadata_version": "1",
+            "processing_attempts": "0",
+            "library_folder": "'Sem pasta'",
+            "library_season": "'Sem temporada'",
+        }
+        select_exprs = [column if column in old_columns else defaults.get(column, "NULL") for column in target_columns]
+        self.db.execute(
+            f"""INSERT OR IGNORE INTO media_files ({', '.join(target_columns)})
+                SELECT {', '.join(select_exprs)}
+                FROM {backup_name}"""
+        )
+        self._create_media_indexes()
+        self.db.commit()
+
+    def _create_media_files_table(self) -> None:
+        """Criar tabela media_files sem UNIQUE global de arquivo/hash."""
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS media_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                import_session_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_extension TEXT,
+                file_size_bytes INTEGER,
+                file_hash TEXT NOT NULL,
+                is_duplicate BOOLEAN DEFAULT 0,
+                duplicate_of_hash TEXT,
+                duration_seconds REAL,
+                fps REAL,
+                width INTEGER,
+                height INTEGER,
+                resolution TEXT,
+                codec_video TEXT,
+                codec_audio TEXT,
+                audio_channels INTEGER,
+                status TEXT DEFAULT 'metadata_pending',
+                import_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                metadata_version INTEGER DEFAULT 1,
+                processing_attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                library_folder TEXT DEFAULT 'Sem pasta',
+                library_season TEXT DEFAULT 'Sem temporada',
+                FOREIGN KEY (import_session_id) REFERENCES import_sessions(session_id)
+            )"""
+        )
+
+    def _create_media_indexes(self) -> None:
+        """Criar índices usados pela biblioteca."""
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_import_session ON media_files(import_session_id)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_file_hash ON media_files(file_hash)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_file_path ON media_files(file_path)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_status ON media_files(status)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_import_date ON media_files(import_date)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_is_duplicate ON media_files(is_duplicate)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_library_folder ON media_files(library_folder)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_library_season ON media_files(library_season)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_library_folder_season ON media_files(library_folder, library_season)")
+
     def create_import_session(self, session_id: str, folder_path: str) -> int:
         """Criar nova sessão de importação.
-        
-        Args:
-            session_id: ID único da sessão
-            folder_path: Caminho da pasta a importar
-            
-        Returns:
-            ID da sessão no banco de dados
+
+        É idempotente: se a sessão já existir, retorna o ID existente.
         """
         try:
+            existing = self.db.execute(
+                "SELECT id FROM import_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if existing:
+                return int(existing[0])
+
             cursor = self.db.execute(
                 """INSERT INTO import_sessions (session_id, folder_path, status)
                    VALUES (?, ?, 'IN_PROGRESS')""",
-                (session_id, folder_path)
+                (session_id, folder_path),
             )
             self.db.commit()
-            session_pk = cursor.lastrowid
-            logger.info(f"Sessão de importação criada: {session_id} (pk={session_pk})")
-            return session_pk
-        except Exception as e:
-            logger.error(f"Erro ao criar sessão: {e}", exc_info=True)
+            return int(cursor.lastrowid)
+        except Exception as exc:
+            logger.error("Erro ao criar sessão: %s", exc, exc_info=True)
             raise
-    
-    def add_media_file(self, media: MediaFile, session_id: str) -> Optional[MediaId]:
-        """Adicionar arquivo de mídia ao repositório.
-        
-        Args:
-            media: MediaFile a adicionar
-            session_id: ID da sessão de importação
-            
-        Returns:
-            MediaId do arquivo adicionado ou None se já existe
-        """
+
+    def add(self, media: MediaFile) -> MediaFile:
+        """Adicionar arquivo de mídia usando a sessão ativa."""
+        session_id = self._active_session_id
+        if not session_id:
+            raise RuntimeError("Sessão ativa de importação não definida no repositório")
+
+        media_id = self.add_media_file(media, session_id)
+        if media_id is None:
+            raise sqlite3.IntegrityError("Arquivo duplicado ou já existente")
+
+        media.id = media_id
+        return media
+
+    def update(self, media: MediaFile) -> MediaFile:
+        """Atualizar dados principais do arquivo de mídia."""
+        if media.id is None:
+            raise ValueError("Não é possível atualizar mídia sem ID")
+
         try:
-            # Verificar duplicata
-            existing = self.find_by_hash(media.hash_info.file_hash)
-            if existing:
-                logger.debug(f"Arquivo duplicado detectado: {media.file_info.file_hash}")
+            self.db.execute(
+                """UPDATE media_files SET
+                   status = ?,
+                   metadata_version = ?,
+                   processing_attempts = ?,
+                   last_error = ?
+                   WHERE id = ?""",
+                (
+                    media.processing_info.status.value,
+                    media.processing_info.metadata_version,
+                    media.processing_info.processing_attempts,
+                    media.processing_info.last_error,
+                    media.id.value,
+                ),
+            )
+            self.db.commit()
+            return media
+        except Exception as exc:
+            logger.error("Erro ao atualizar arquivo: %s", exc, exc_info=True)
+            raise
+
+    def add_media_file(self, media: MediaFile, session_id: str) -> Optional[MediaId]:
+        """Adicionar arquivo de mídia ao repositório."""
+        try:
+            library_folder = self._normalize_folder_name(getattr(self, "_active_library_folder", None))
+            library_season = self._normalize_season_name(getattr(self, "_active_library_season", None))
+
+            existing_same_location = self.find_by_hash_in_location(
+                media.hash_info.file_hash,
+                library_folder,
+                library_season,
+                originals_only=True,
+            )
+            if existing_same_location and not media.hash_info.is_duplicate:
+                logger.info(
+                    "Arquivo duplicado na mesma pasta/temporada: %s | %s / %s",
+                    media.file_info.file_path,
+                    library_folder,
+                    library_season,
+                )
                 return None
-            
-            # Inserir novo arquivo
+
+            display_file_name = media.file_info.file_name
+            name_conflict = self.find_name_conflict_in_location(
+                display_file_name,
+                library_folder,
+                library_season,
+            )
+            if name_conflict and str(name_conflict.hash_info.file_hash) != str(media.hash_info.file_hash):
+                display_file_name = self.generate_unique_file_name(
+                    display_file_name,
+                    library_folder,
+                    library_season,
+                )
+                logger.info(
+                    "Nome repetido na mesma pasta/temporada. Nome visual ajustado para: %s",
+                    display_file_name,
+                )
+
             cursor = self.db.execute(
                 """INSERT INTO media_files (
                     import_session_id, file_path, file_name, file_extension,
                     file_size_bytes, file_hash, is_duplicate, duplicate_of_hash,
                     duration_seconds, fps, width, height, resolution,
                     codec_video, codec_audio, audio_channels, status,
-                    metadata_version, processing_attempts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    metadata_version, processing_attempts, library_folder, library_season
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     media.file_info.file_path,
-                    media.file_info.file_name,
+                    display_file_name,
                     media.file_info.file_extension,
                     media.file_info.file_size.bytes,
                     str(media.hash_info.file_hash),
@@ -122,299 +332,715 @@ class SQLiteMediaRepository:
                     media.audio_info.audio_channels,
                     media.processing_info.status.value,
                     media.processing_info.metadata_version,
-                    media.processing_info.processing_attempts
-                )
+                    media.processing_info.processing_attempts,
+                    library_folder,
+                    library_season,
+                ),
             )
             self.db.commit()
-            
             media_id = MediaId(cursor.lastrowid)
-            logger.info(f"Arquivo de mídia adicionado: {media.file_info.file_name} (id={media_id})")
+            logger.info("Arquivo de mídia adicionado: %s (id=%s)", media.file_info.file_name, media_id.value)
             return media_id
-            
-        except sqlite3.IntegrityError as e:
-            logger.warning(f"Arquivo já existe ou viola constraint: {e}")
+        except sqlite3.IntegrityError as exc:
+            logger.info("Arquivo já existe ou viola constraint: %s", exc)
             return None
-        except Exception as e:
-            logger.error(f"Erro ao adicionar arquivo: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("Erro ao adicionar arquivo: %s", exc, exc_info=True)
             raise
-    
+
     def find_by_hash(self, file_hash: FileHash) -> Optional[MediaFile]:
-        """Encontrar arquivo por hash.
-        
-        Args:
-            file_hash: Hash SHA-256 do arquivo
-            
-        Returns:
-            MediaFile se encontrado, None caso contrário
-        """
         try:
             cursor = self.db.execute(
                 "SELECT * FROM media_files WHERE file_hash = ?",
-                (str(file_hash),)
+                (str(file_hash),),
             )
             row = cursor.fetchone()
-            if row:
-                return self._row_to_media_file(row)
-            return None
-        except Exception as e:
-            logger.error(f"Erro ao buscar por hash: {e}", exc_info=True)
+            return self._row_to_media_file(row) if row else None
+        except Exception as exc:
+            logger.error("Erro ao buscar por hash: %s", exc, exc_info=True)
             raise
-    
+
+    def find_by_hash_in_location(
+        self,
+        file_hash: FileHash,
+        library_folder: Optional[str] = None,
+        library_season: Optional[str] = None,
+        originals_only: bool = True,
+    ) -> Optional[MediaFile]:
+        """Encontrar arquivo por hash dentro da mesma pasta/temporada interna."""
+        folder = self._normalize_folder_name(library_folder or getattr(self, "_active_library_folder", None))
+        season = self._normalize_season_name(library_season or getattr(self, "_active_library_season", None))
+        try:
+            sql = (
+                "SELECT * FROM media_files WHERE file_hash = ? "
+                "AND library_folder = ? AND COALESCE(library_season, 'Sem temporada') = ?"
+            )
+            params: list[Any] = [str(file_hash), folder, season]
+            if originals_only:
+                sql += " AND COALESCE(is_duplicate, 0) = 0"
+            sql += " ORDER BY import_date ASC LIMIT 1"
+            cursor = self.db.execute(sql, tuple(params))
+            row = cursor.fetchone()
+            return self._row_to_media_file(row) if row else None
+        except Exception as exc:
+            logger.error("Erro ao buscar por hash na pasta/temporada: %s", exc, exc_info=True)
+            raise
+
     def find_by_status(self, status: ProcessingStatus, limit: int = 100) -> List[MediaFile]:
-        """Encontrar arquivos por status.
-        
-        Args:
-            status: Status de processamento
-            limit: Limite de resultados
-            
-        Returns:
-            Lista de MediaFiles
-        """
         try:
             cursor = self.db.execute(
-                "SELECT * FROM media_files WHERE status = ? LIMIT ?",
-                (status.value, limit)
+                "SELECT * FROM media_files WHERE status = ? ORDER BY import_date DESC LIMIT ?",
+                (status.value, limit),
             )
-            rows = cursor.fetchall()
-            return [self._row_to_media_file(row) for row in rows]
-        except Exception as e:
-            logger.error(f"Erro ao buscar por status: {e}", exc_info=True)
+            return [self._row_to_media_file(row) for row in cursor.fetchall()]
+        except Exception as exc:
+            logger.error("Erro ao buscar por status: %s", exc, exc_info=True)
             raise
-    
+
     def find_by_session(self, session_id: str) -> List[MediaFile]:
-        """Encontrar todos os arquivos de uma sessão.
-        
-        Args:
-            session_id: ID da sessão
-            
-        Returns:
-            Lista de MediaFiles
-        """
         try:
             cursor = self.db.execute(
                 "SELECT * FROM media_files WHERE import_session_id = ? ORDER BY import_date DESC",
-                (session_id,)
+                (session_id,),
             )
-            rows = cursor.fetchall()
-            return [self._row_to_media_file(row) for row in rows]
-        except Exception as e:
-            logger.error(f"Erro ao buscar por sessão: {e}", exc_info=True)
+            return [self._row_to_media_file(row) for row in cursor.fetchall()]
+        except Exception as exc:
+            logger.error("Erro ao buscar por sessão: %s", exc, exc_info=True)
             raise
-    
-    def find_by_id(self, media_id: MediaId) -> Optional[MediaFile]:
-        """Encontrar arquivo por ID.
-        
-        Args:
-            media_id: ID do arquivo
-            
-        Returns:
-            MediaFile se encontrado
+
+    def find_all(
+        self,
+        limit: int = 500,
+        offset: int = 0,
+        library_folder: Optional[str] = None,
+        library_season: Optional[str] = None,
+        order_by: str = "date",
+        descending: bool = True,
+    ) -> List[MediaFile]:
+        """Encontrar arquivos com filtro de pasta, temporada e ordenação."""
+        try:
+            use_natural_sort = order_by in {"name", "name_natural"}
+            order_clause = "ORDER BY import_date DESC" if use_natural_sort else self._order_clause(order_by, descending)
+
+            where_clauses = []
+            params: list[Any] = []
+
+            if library_folder and library_folder != "Todas":
+                where_clauses.append("library_folder = ?")
+                params.append(library_folder)
+
+            if library_season and library_season != "Todas":
+                where_clauses.append("COALESCE(library_season, 'Sem temporada') = ?")
+                params.append(library_season)
+
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            cursor = self.db.execute(
+                f"SELECT * FROM media_files {where_sql} {order_clause} LIMIT ? OFFSET ?",
+                tuple(params + [limit, offset]),
+            )
+            items = [self._row_to_media_file(row) for row in cursor.fetchall()]
+
+            if use_natural_sort:
+                items.sort(
+                    key=lambda media: self._natural_sort_key(media.file_info.file_name),
+                    reverse=descending,
+                )
+
+            return items
+        except Exception as exc:
+            logger.error("Erro ao listar todos os arquivos: %s", exc, exc_info=True)
+            raise
+
+    def _normalize_folder_name(self, folder_name: Optional[str]) -> str:
+        """Normalizar nome da pasta interna."""
+        name = (folder_name or "Sem pasta").strip()
+        return name or "Sem pasta"
+
+    def _normalize_season_name(self, season_name: Optional[str]) -> str:
+        """Normalizar nome da temporada interna."""
+        name = (season_name or "Sem temporada").strip()
+        return name or "Sem temporada"
+
+    def _natural_sort_key(self, text: str) -> list[Any]:
+        """Chave de ordenação natural: Ep 2 vem antes de Ep 10."""
+        return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", text or "")]
+
+    def get_library_folders(self) -> List[str]:
+        """Listar pastas internas da biblioteca."""
+        try:
+            self.create_library_folder("Sem pasta")
+            cursor = self.db.execute(
+                "SELECT name FROM media_folders ORDER BY CASE WHEN name = 'Sem pasta' THEN 0 ELSE 1 END, name COLLATE NOCASE"
+            )
+            return [row[0] for row in cursor.fetchall()]
+        except Exception as exc:
+            logger.error("Erro ao listar pastas da biblioteca: %s", exc, exc_info=True)
+            raise
+
+    def create_library_folder(self, folder_name: str) -> str:
+        """Criar pasta interna da biblioteca."""
+        name = self._normalize_folder_name(folder_name)
+        try:
+            self.db.execute(
+                "INSERT OR IGNORE INTO media_folders (name) VALUES (?)",
+                (name,),
+            )
+            self.db.commit()
+            return name
+        except Exception as exc:
+            logger.error("Erro ao criar pasta da biblioteca: %s", exc, exc_info=True)
+            raise
+
+    def get_library_seasons(self, folder_name: Optional[str] = None) -> List[str]:
+        """Listar temporadas internas, opcionalmente por pasta."""
+        folder = self._normalize_folder_name(folder_name) if folder_name and folder_name != "Todas" else None
+        try:
+            if folder:
+                self.create_library_season(folder, "Sem temporada")
+                cursor = self.db.execute(
+                    """SELECT name FROM media_seasons
+                       WHERE folder_name = ?
+                       ORDER BY CASE WHEN name = 'Sem temporada' THEN 0 ELSE 1 END, name COLLATE NOCASE""",
+                    (folder,),
+                )
+            else:
+                cursor = self.db.execute(
+                    """SELECT DISTINCT name FROM media_seasons
+                       ORDER BY CASE WHEN name = 'Sem temporada' THEN 0 ELSE 1 END, name COLLATE NOCASE"""
+                )
+            seasons = [row[0] for row in cursor.fetchall()]
+            return seasons or ["Sem temporada"]
+        except Exception as exc:
+            logger.error("Erro ao listar temporadas da biblioteca: %s", exc, exc_info=True)
+            raise
+
+    def create_library_season(self, folder_name: str, season_name: str) -> str:
+        """Criar temporada dentro de uma pasta interna."""
+        folder = self.create_library_folder(folder_name)
+        season = self._normalize_season_name(season_name)
+        try:
+            self.db.execute(
+                "INSERT OR IGNORE INTO media_seasons (folder_name, name) VALUES (?, ?)",
+                (folder, season),
+            )
+            self.db.commit()
+            return season
+        except Exception as exc:
+            logger.error("Erro ao criar temporada da biblioteca: %s", exc, exc_info=True)
+            raise
+
+    def count_media_in_folder(self, folder_name: str) -> int:
+        """Contar quantas mídias existem em uma pasta interna."""
+        folder = self._normalize_folder_name(folder_name)
+        cursor = self.db.execute(
+            "SELECT COUNT(*) FROM media_files WHERE library_folder = ?",
+            (folder,),
+        )
+        return int(cursor.fetchone()[0] or 0)
+
+    def count_media_in_season(self, folder_name: str, season_name: str) -> int:
+        """Contar quantas mídias existem em uma temporada de uma pasta."""
+        folder = self._normalize_folder_name(folder_name)
+        season = self._normalize_season_name(season_name)
+        cursor = self.db.execute(
+            """SELECT COUNT(*) FROM media_files
+               WHERE library_folder = ?
+                 AND COALESCE(library_season, 'Sem temporada') = ?""",
+            (folder, season),
+        )
+        return int(cursor.fetchone()[0] or 0)
+
+    def delete_library_folder(self, folder_name: str, delete_media: bool = True) -> int:
+        """Excluir uma pasta interna e, opcionalmente, todas as mídias nela.
+
+        Não apaga os arquivos originais do computador. Remove apenas os registros
+        da biblioteca TEDVHS Studio.
         """
+        folder = self._normalize_folder_name(folder_name)
+        if folder == "Sem pasta":
+            raise ValueError("A pasta padrão 'Sem pasta' não pode ser excluída.")
+
+        media_count = self.count_media_in_folder(folder)
+        if media_count and not delete_media:
+            raise ValueError("A pasta contém arquivos e não pode ser excluída sem remover as mídias.")
+
+        try:
+            if delete_media:
+                self.db.execute(
+                    "DELETE FROM media_files WHERE library_folder = ?",
+                    (folder,),
+                )
+            self.db.execute(
+                "DELETE FROM media_seasons WHERE folder_name = ?",
+                (folder,),
+            )
+            cursor = self.db.execute(
+                "DELETE FROM media_folders WHERE name = ?",
+                (folder,),
+            )
+            self.db.commit()
+            return int(media_count if delete_media else cursor.rowcount)
+        except Exception as exc:
+            logger.error("Erro ao excluir pasta da biblioteca: %s", exc, exc_info=True)
+            raise
+
+    def delete_library_season(
+        self,
+        folder_name: str,
+        season_name: str,
+        delete_media: bool = True,
+    ) -> int:
+        """Excluir uma temporada interna e, opcionalmente, todas as mídias nela.
+
+        Não apaga os arquivos originais do computador. Remove apenas os registros
+        da biblioteca TEDVHS Studio.
+        """
+        folder = self._normalize_folder_name(folder_name)
+        season = self._normalize_season_name(season_name)
+        if season == "Sem temporada":
+            raise ValueError("A temporada padrão 'Sem temporada' não pode ser excluída.")
+
+        media_count = self.count_media_in_season(folder, season)
+        if media_count and not delete_media:
+            raise ValueError("A temporada contém arquivos e não pode ser excluída sem remover as mídias.")
+
+        try:
+            if delete_media:
+                self.db.execute(
+                    """DELETE FROM media_files
+                       WHERE library_folder = ?
+                         AND COALESCE(library_season, 'Sem temporada') = ?""",
+                    (folder, season),
+                )
+            cursor = self.db.execute(
+                "DELETE FROM media_seasons WHERE folder_name = ? AND name = ?",
+                (folder, season),
+            )
+            self.db.commit()
+            return int(media_count if delete_media else cursor.rowcount)
+        except Exception as exc:
+            logger.error("Erro ao excluir temporada da biblioteca: %s", exc, exc_info=True)
+            raise
+
+    def _media_id_value(self, media_id: Any) -> int:
+        """Extrair valor inteiro de MediaId ou ID bruto."""
+        return int(media_id.value if hasattr(media_id, "value") else media_id)
+
+    def find_hash_conflict_in_location(
+        self,
+        file_hash: FileHash,
+        library_folder: str,
+        library_season: str,
+        exclude_media_id: Optional[Any] = None,
+    ) -> Optional[MediaFile]:
+        """Encontrar mídia com mesmo hash no destino, ignorando o próprio arquivo."""
+        folder = self._normalize_folder_name(library_folder)
+        season = self._normalize_season_name(library_season)
+        params: list[Any] = [str(file_hash), folder, season]
+        exclude_sql = ""
+        if exclude_media_id is not None:
+            exclude_sql = " AND id <> ?"
+            params.append(self._media_id_value(exclude_media_id))
+
+        cursor = self.db.execute(
+            """SELECT * FROM media_files
+               WHERE file_hash = ?
+                 AND library_folder = ?
+                 AND COALESCE(library_season, 'Sem temporada') = ?
+                 AND COALESCE(is_duplicate, 0) = 0"""
+            + exclude_sql
+            + " ORDER BY import_date ASC LIMIT 1",
+            tuple(params),
+        )
+        row = cursor.fetchone()
+        return self._row_to_media_file(row) if row else None
+
+    def find_name_conflict_in_location(
+        self,
+        file_name: str,
+        library_folder: str,
+        library_season: str,
+        exclude_media_id: Optional[Any] = None,
+    ) -> Optional[MediaFile]:
+        """Encontrar mídia com mesmo nome no destino, ignorando o próprio arquivo."""
+        folder = self._normalize_folder_name(library_folder)
+        season = self._normalize_season_name(library_season)
+        params: list[Any] = [file_name, folder, season]
+        exclude_sql = ""
+        if exclude_media_id is not None:
+            exclude_sql = " AND id <> ?"
+            params.append(self._media_id_value(exclude_media_id))
+
+        cursor = self.db.execute(
+            """SELECT * FROM media_files
+               WHERE file_name = ?
+                 AND library_folder = ?
+                 AND COALESCE(library_season, 'Sem temporada') = ?"""
+            + exclude_sql
+            + " ORDER BY import_date ASC LIMIT 1",
+            tuple(params),
+        )
+        row = cursor.fetchone()
+        return self._row_to_media_file(row) if row else None
+
+    def generate_unique_file_name(
+        self,
+        file_name: str,
+        library_folder: str,
+        library_season: str,
+        exclude_media_id: Optional[Any] = None,
+    ) -> str:
+        """Gerar nome visual único no destino, no estilo Windows: Nome (1).ext."""
+        folder = self._normalize_folder_name(library_folder)
+        season = self._normalize_season_name(library_season)
+        path = Path(file_name)
+        stem = path.stem or file_name
+        suffix = path.suffix
+
+        candidate = file_name
+        counter = 1
+        while self.find_name_conflict_in_location(candidate, folder, season, exclude_media_id):
+            candidate = f"{stem} ({counter}){suffix}"
+            counter += 1
+        return candidate
+
+    def update_media_file_name(self, media_id: Any, new_file_name: str) -> bool:
+        """Alterar apenas o nome exibido na biblioteca, sem renomear o arquivo original no disco."""
+        media_id_value = self._media_id_value(media_id)
+        clean_name = (new_file_name or "").strip()
+        if not clean_name:
+            raise ValueError("Nome do arquivo não pode ficar vazio")
+
         try:
             cursor = self.db.execute(
+                "UPDATE media_files SET file_name = ? WHERE id = ?",
+                (clean_name, media_id_value),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
+        except Exception as exc:
+            logger.error("Erro ao renomear mídia na biblioteca: %s", exc, exc_info=True)
+            raise
+
+    def set_media_folder(self, media_id: Any, folder_name: str) -> bool:
+        """Mover uma mídia para uma pasta interna, mantendo a temporada atual."""
+        media = self.find_by_id(media_id)
+        current_season = "Sem temporada"
+        if media is not None:
+            current_season = str(media.custom_metadata.get("library_season") or "Sem temporada")
+        return self.set_media_folder_season(media_id, folder_name, current_season)
+
+    def set_media_folder_season(
+        self,
+        media_id: Any,
+        folder_name: str,
+        season_name: str,
+        new_file_name: Optional[str] = None,
+        allow_same_hash: bool = False,
+    ) -> bool:
+        """Mover uma mídia para pasta + temporada internas.
+
+        Por padrão, bloqueia movimentação quando o mesmo hash já existe no destino.
+        Isso evita duas entradas idênticas na mesma Pasta/Temporada.
+        """
+        media_id_value = self._media_id_value(media_id)
+        folder = self.create_library_folder(folder_name)
+        season = self.create_library_season(folder, season_name)
+        media = self.find_by_id(media_id_value)
+        if media is None:
+            return False
+
+        hash_conflict = self.find_hash_conflict_in_location(
+            media.hash_info.file_hash,
+            folder,
+            season,
+            exclude_media_id=media_id_value,
+        )
+        if hash_conflict and not allow_same_hash:
+            raise ValueError(
+                "Este mesmo vídeo já existe na pasta/temporada de destino. "
+                "A movimentação foi negada para evitar duplicidade."
+            )
+
+        final_name = (new_file_name or media.file_info.file_name).strip() or media.file_info.file_name
+        try:
+            cursor = self.db.execute(
+                """UPDATE media_files
+                   SET library_folder = ?, library_season = ?, file_name = ?
+                   WHERE id = ?""",
+                (folder, season, final_name, media_id_value),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
+        except Exception as exc:
+            logger.error("Erro ao mover mídia para pasta/temporada: %s", exc, exc_info=True)
+            raise
+
+    def set_many_media_folder(self, media_ids: List[Any], folder_name: str) -> int:
+        """Mover várias mídias para uma pasta interna."""
+        moved = 0
+        for media_id in media_ids:
+            if self.set_media_folder(media_id, folder_name):
+                moved += 1
+        return moved
+
+    def set_many_media_folder_season(self, media_ids: List[Any], folder_name: str, season_name: str) -> int:
+        """Mover várias mídias para pasta + temporada internas."""
+        moved = 0
+        for media_id in media_ids:
+            if self.set_media_folder_season(media_id, folder_name, season_name):
+                moved += 1
+        return moved
+
+    def _order_clause(self, order_by: str = "import_date", descending: bool = True) -> str:
+        """Gerar ORDER BY seguro para a biblioteca."""
+        allowed = {
+            "name": "file_name COLLATE NOCASE",
+            "size": "file_size_bytes",
+            "date": "import_date",
+            "duration": "duration_seconds",
+            "resolution": "width * height",
+            "status": "status COLLATE NOCASE",
+            "folder": "library_folder COLLATE NOCASE",
+            "season": "library_season COLLATE NOCASE",
+            "import_date": "import_date",
+        }
+        column = allowed.get(order_by, "import_date")
+        direction = "DESC" if descending else "ASC"
+        return f"ORDER BY {column} {direction}, file_name COLLATE NOCASE ASC"
+
+    def find_by_id(self, media_id: Any) -> Optional[MediaFile]:
+        try:
+            media_id_value = self._media_id_value(media_id)
+            cursor = self.db.execute(
                 "SELECT * FROM media_files WHERE id = ?",
-                (media_id.value,)
+                (media_id_value,),
             )
             row = cursor.fetchone()
-            if row:
-                return self._row_to_media_file(row)
-            return None
-        except Exception as e:
-            logger.error(f"Erro ao buscar por ID: {e}", exc_info=True)
+            return self._row_to_media_file(row) if row else None
+        except Exception as exc:
+            logger.error("Erro ao buscar por ID: %s", exc, exc_info=True)
             raise
-    
+
+    def delete_media_file(self, media_id: Any) -> bool:
+        """Excluir uma mídia da biblioteca pelo ID."""
+        try:
+            media_id_value = media_id.value if hasattr(media_id, "value") else int(media_id)
+            cursor = self.db.execute("DELETE FROM media_files WHERE id = ?", (media_id_value,))
+            self.db.commit()
+            return cursor.rowcount > 0
+        except Exception as exc:
+            logger.error("Erro ao deletar arquivo: %s", exc, exc_info=True)
+            raise
+
     def update_status(self, media_id: MediaId, status: ProcessingStatus) -> bool:
-        """Atualizar status do arquivo.
-        
-        Args:
-            media_id: ID do arquivo
-            status: Novo status
-            
-        Returns:
-            True se atualizado com sucesso
-        """
         try:
             cursor = self.db.execute(
                 "UPDATE media_files SET status = ? WHERE id = ?",
-                (status.value, media_id.value)
+                (status.value, media_id.value),
             )
             self.db.commit()
             return cursor.rowcount > 0
-        except Exception as e:
-            logger.error(f"Erro ao atualizar status: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("Erro ao atualizar status: %s", exc, exc_info=True)
             raise
-    
+
     def update_session_stats(self, session_id: str, stats: Dict[str, Any]) -> bool:
         """Atualizar estatísticas da sessão.
-        
-        Args:
-            session_id: ID da sessão
-            stats: Dicionário com estatísticas
-            
-        Returns:
-            True se atualizado com sucesso
+
+        Aceita tanto nomes internos do pipeline (`files_found`) quanto nomes do banco
+        (`total_files_found`).
         """
         try:
+            status = stats.get("status", "IN_PROGRESS")
+            completed_at = datetime.utcnow().isoformat() if status in {"COMPLETED", "FAILED", "CANCELLED"} else None
+
             cursor = self.db.execute(
-                """UPDATE import_sessions SET 
+                """UPDATE import_sessions SET
                    total_files_found = ?,
                    total_files_valid = ?,
                    total_files_imported = ?,
+                   total_files_duplicate = ?,
                    total_files_failed = ?,
                    total_duration_seconds = ?,
                    total_size_bytes = ?,
-                   completed_at = ?,
+                   completed_at = COALESCE(?, completed_at),
                    status = ?
                    WHERE session_id = ?""",
                 (
-                    stats.get('total_files_found', 0),
-                    stats.get('total_files_valid', 0),
-                    stats.get('total_files_imported', 0),
-                    stats.get('total_files_failed', 0),
-                    stats.get('total_duration_seconds', 0),
-                    stats.get('total_size_bytes', 0),
-                    datetime.utcnow().isoformat(),
-                    stats.get('status', 'COMPLETED'),
-                    session_id
-                )
+                    stats.get("total_files_found", stats.get("files_found", 0)),
+                    stats.get("total_files_valid", stats.get("files_valid", 0)),
+                    stats.get("total_files_imported", stats.get("files_imported", 0)),
+                    stats.get("total_files_duplicate", stats.get("files_duplicate", 0)),
+                    stats.get("total_files_failed", stats.get("files_failed", 0)),
+                    stats.get("total_duration_seconds", stats.get("duration_seconds", 0)),
+                    stats.get("total_size_bytes", 0),
+                    completed_at,
+                    status,
+                    session_id,
+                ),
             )
             self.db.commit()
             return cursor.rowcount > 0
-        except Exception as e:
-            logger.error(f"Erro ao atualizar sessão: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("Erro ao atualizar sessão: %s", exc, exc_info=True)
             raise
-    
+
     def get_incomplete_sessions(self) -> List[Dict[str, Any]]:
-        """Obter sessões incompletas (para resume).
-        
-        Returns:
-            Lista de sessões com status IN_PROGRESS
-        """
         try:
             cursor = self.db.execute(
-                """SELECT id, session_id, folder_path, started_at, 
+                """SELECT id, session_id, folder_path, started_at,
                           total_files_found, total_files_imported
-                   FROM import_sessions WHERE status = 'IN_PROGRESS' 
+                   FROM import_sessions
+                   WHERE status IN ('IN_PROGRESS', 'PAUSED')
                    ORDER BY started_at DESC"""
             )
-            rows = cursor.fetchall()
-            result = []
-            for row in rows:
-                result.append({
-                    'id': row[0],
-                    'session_id': row[1],
-                    'folder_path': row[2],
-                    'started_at': row[3],
-                    'total_files_found': row[4],
-                    'total_files_imported': row[5]
-                })
-            return result
-        except Exception as e:
-            logger.error(f"Erro ao buscar sessões incompletas: {e}", exc_info=True)
+            return [
+                {
+                    "id": row[0],
+                    "session_id": row[1],
+                    "folder_path": row[2],
+                    "started_at": row[3],
+                    "total_files_found": row[4],
+                    "total_files_imported": row[5],
+                }
+                for row in cursor.fetchall()
+            ]
+        except Exception as exc:
+            logger.error("Erro ao buscar sessões incompletas: %s", exc, exc_info=True)
             raise
-    
+
     def get_session_stats(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Obter estatísticas da sessão.
-        
-        Args:
-            session_id: ID da sessão
-            
-        Returns:
-            Dicionário com estatísticas
-        """
         try:
             cursor = self.db.execute(
                 """SELECT total_files_found, total_files_valid, total_files_imported,
-                          total_files_failed, total_duration_seconds, total_size_bytes, status
+                          total_files_duplicate, total_files_failed, total_duration_seconds,
+                          total_size_bytes, status
                    FROM import_sessions WHERE session_id = ?""",
-                (session_id,)
+                (session_id,),
             )
             row = cursor.fetchone()
-            if row:
-                return {
-                    'total_files_found': row[0],
-                    'total_files_valid': row[1],
-                    'total_files_imported': row[2],
-                    'total_files_failed': row[3],
-                    'total_duration_seconds': row[4],
-                    'total_size_bytes': row[5],
-                    'status': row[6]
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Erro ao obter estatísticas: {e}", exc_info=True)
+            if not row:
+                return None
+            return {
+                "total_files_found": row[0],
+                "total_files_valid": row[1],
+                "total_files_imported": row[2],
+                "total_files_duplicate": row[3],
+                "total_files_failed": row[4],
+                "total_duration_seconds": row[5],
+                "total_size_bytes": row[6],
+                "status": row[7],
+            }
+        except Exception as exc:
+            logger.error("Erro ao obter estatísticas: %s", exc, exc_info=True)
             raise
-    
+
     def get_duplicates(self, session_id: str) -> List[Dict[str, Any]]:
-        """Obter arquivos duplicados de uma sessão.
-        
-        Args:
-            session_id: ID da sessão
-            
-        Returns:
-            Lista de arquivos duplicados
-        """
         try:
             cursor = self.db.execute(
-                """SELECT file_name, duplicate_of_hash, import_date 
-                   FROM media_files 
+                """SELECT file_name, duplicate_of_hash, import_date
+                   FROM media_files
                    WHERE import_session_id = ? AND is_duplicate = 1
                    ORDER BY import_date DESC""",
-                (session_id,)
+                (session_id,),
             )
-            rows = cursor.fetchall()
-            return [{
-                'file_name': row[0],
-                'duplicate_of_hash': row[1],
-                'import_date': row[2]
-            } for row in rows]
-        except Exception as e:
-            logger.error(f"Erro ao obter duplicatas: {e}", exc_info=True)
+            return [
+                {
+                    "file_name": row[0],
+                    "duplicate_of_hash": row[1],
+                    "import_date": row[2],
+                }
+                for row in cursor.fetchall()
+            ]
+        except Exception as exc:
+            logger.error("Erro ao obter duplicatas: %s", exc, exc_info=True)
             raise
-    
+
+    def _parse_status(self, value: Any) -> ProcessingStatus:
+        """Converter status salvo no banco para ProcessingStatus com fallback."""
+        raw = str(value or "").strip()
+        normalized = raw.lower()
+
+        aliases = {
+            "pending": ProcessingStatus.METADATA_PENDING,
+            "processando": ProcessingStatus.METADATA_PENDING,
+            "processing": ProcessingStatus.METADATA_PENDING,
+            "completed": ProcessingStatus.READY,
+            "complete": ProcessingStatus.READY,
+            "concluido": ProcessingStatus.READY,
+            "concluído": ProcessingStatus.READY,
+            "error": ProcessingStatus.FAILED,
+            "erro": ProcessingStatus.FAILED,
+            "duplicate": ProcessingStatus.SKIPPED,
+            "duplicado": ProcessingStatus.SKIPPED,
+            "skipped": ProcessingStatus.SKIPPED,
+        }
+        if normalized in aliases:
+            return aliases[normalized]
+
+        try:
+            return ProcessingStatus(normalized)
+        except ValueError:
+            logger.warning("Status desconhecido no banco: %s. Usando METADATA_EXTRACTED.", raw)
+            return ProcessingStatus.METADATA_EXTRACTED
+
+    def _parse_datetime(self, value: Any) -> datetime:
+        if isinstance(value, datetime):
+            return value
+        if not value:
+            return datetime.utcnow()
+        text = str(value)
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return datetime.utcnow()
+
     def _row_to_media_file(self, row: tuple) -> MediaFile:
-        """Converter linha do banco para MediaFile.
-        
-        Args:
-            row: Tupla de dados do banco
-            
-        Returns:
-            MediaFile reconstruído
-        """
-        # Índices da tupla (do SELECT * FROM media_files)
-        (media_id, session_id, file_path, file_name, file_ext, file_size,
-         file_hash, is_dup, dup_hash, duration, fps, width, height, res_str,
+        values = list(row)
+        # Bancos antigos podem não ter as colunas library_folder/library_season.
+        library_folder = values[22] if len(values) > 22 else "Sem pasta"
+        library_season = values[23] if len(values) > 23 else "Sem temporada"
+        (media_id, _session_id, file_path, file_name, file_ext, file_size,
+         file_hash, is_dup, dup_hash, duration, fps, width, height, _res_str,
          codec_video, codec_audio, audio_ch, status, import_date, metadata_ver,
-         attempts, last_error) = row
-        
-        return MediaFile(
+         attempts, last_error) = values[:22]
+
+        media = MediaFile(
             id=MediaId(media_id),
             file_info=FileInfo(
                 file_path=file_path,
                 file_name=file_name,
                 file_name_clean=Path(file_name).stem,
                 file_extension=file_ext or "",
-                file_size=FileSize(file_size or 0)
+                file_size=FileSize(file_size or 0),
             ),
             video_info=VideoInfo(
                 duration=Duration(duration or 0.0),
                 fps=fps or 0.0,
                 resolution=Resolution(width, height) if width and height else None,
-                codec_video=codec_video or ""
+                codec_video=codec_video or "",
             ),
             audio_info=AudioInfo(
                 codec_audio=codec_audio,
-                audio_channels=audio_ch or 0
+                audio_channels=audio_ch or 0,
             ),
             processing_info=ProcessingInfo(
-                status=ProcessingStatus(status),
+                status=self._parse_status(status),
+                import_date=self._parse_datetime(import_date),
                 metadata_version=metadata_ver or 0,
                 processing_attempts=attempts or 0,
-                last_error=last_error
+                last_error=last_error,
             ),
             hash_info=HashInfo(
                 file_hash=FileHash(file_hash),
                 is_duplicate=bool(is_dup),
-                duplicate_of_hash=FileHash(dup_hash) if dup_hash else None
-            )
+                duplicate_of_hash=FileHash(dup_hash) if dup_hash else None,
+            ),
         )
+        media.custom_metadata["library_folder"] = library_folder or "Sem pasta"
+        media.custom_metadata["library_season"] = library_season or "Sem temporada"
+        return media

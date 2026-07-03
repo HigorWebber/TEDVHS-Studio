@@ -205,13 +205,17 @@ class MainWindow(QMainWindow):
                 self.orchestrator.current_session_id
             )
             if progress:
+                status = progress.get("status", "IN_PROGRESS")
+                stage = progress.get("stage") or status
                 status_text = (
-                    f"Importação: {progress['total_files_imported']}/{progress['total_files_found']} "
-                    f"({progress['percentage']}%) | Falhas: {progress['total_files_failed']}"
+                    f"{stage}: {progress.get('percentage', 0)}% | "
+                    f"Importados: {progress.get('total_files_imported', 0)} | "
+                    f"Duplicados: {progress.get('total_files_duplicate', 0)} | "
+                    f"Falhas: {progress.get('total_files_failed', 0)}"
                 )
                 self.status_label.setText(status_text)
-        else:
-            self.status_label.setText("Pronto")
+                return
+        self.status_label.setText("Pronto")
     
     def _on_import_library(self) -> None:
         """Abre dialog de importação de biblioteca."""
