@@ -1,6 +1,7 @@
 """Implementação de repository SQLite para Media Library Engine."""
 
 import logging
+import json
 import re
 import sqlite3
 from datetime import datetime
@@ -53,6 +54,7 @@ class SQLiteMediaRepository:
 
             self._ensure_import_session_columns()
             self._ensure_library_folder_schema()
+            self._ensure_scene_schema()
             self._migrate_media_files_uniqueness_if_needed()
         except Exception as exc:
             logger.error("Erro ao garantir schema: %s", exc, exc_info=True)
@@ -202,6 +204,68 @@ class SQLiteMediaRepository:
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_library_folder ON media_files(library_folder)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_library_season ON media_files(library_season)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_library_folder_season ON media_files(library_folder, library_season)")
+
+    def _ensure_scene_schema(self) -> None:
+        """Criar estrutura de cenas detectadas e catálogo visual."""
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS media_scenes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_id INTEGER NOT NULL,
+                scene_number INTEGER NOT NULL,
+                start_seconds REAL NOT NULL,
+                end_seconds REAL NOT NULL,
+                duration_seconds REAL NOT NULL,
+                custom_start_seconds REAL,
+                custom_end_seconds REAL,
+                custom_duration_seconds REAL,
+                is_merged INTEGER DEFAULT 0,
+                source_scene_ids TEXT,
+                segments_json TEXT,
+                display_name TEXT,
+                detection_threshold REAL DEFAULT 0.35,
+                status TEXT DEFAULT 'detected',
+                description TEXT,
+                tags TEXT,
+                scene_type TEXT DEFAULT 'Geral',
+                thumbnail_path TEXT,
+                analysis_frames_json TEXT,
+                ai_status TEXT DEFAULT 'pending',
+                is_favorite INTEGER DEFAULT 0,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP,
+                FOREIGN KEY (media_id) REFERENCES media_files(id) ON DELETE CASCADE,
+                UNIQUE(media_id, scene_number)
+            )"""
+        )
+
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(media_scenes)").fetchall()}
+        migrations = {
+            "custom_start_seconds": "ALTER TABLE media_scenes ADD COLUMN custom_start_seconds REAL",
+            "custom_end_seconds": "ALTER TABLE media_scenes ADD COLUMN custom_end_seconds REAL",
+            "custom_duration_seconds": "ALTER TABLE media_scenes ADD COLUMN custom_duration_seconds REAL",
+            "is_merged": "ALTER TABLE media_scenes ADD COLUMN is_merged INTEGER DEFAULT 0",
+            "source_scene_ids": "ALTER TABLE media_scenes ADD COLUMN source_scene_ids TEXT",
+            "segments_json": "ALTER TABLE media_scenes ADD COLUMN segments_json TEXT",
+            "display_name": "ALTER TABLE media_scenes ADD COLUMN display_name TEXT",
+            "description": "ALTER TABLE media_scenes ADD COLUMN description TEXT",
+            "tags": "ALTER TABLE media_scenes ADD COLUMN tags TEXT",
+            "scene_type": "ALTER TABLE media_scenes ADD COLUMN scene_type TEXT DEFAULT 'Geral'",
+            "thumbnail_path": "ALTER TABLE media_scenes ADD COLUMN thumbnail_path TEXT",
+            "analysis_frames_json": "ALTER TABLE media_scenes ADD COLUMN analysis_frames_json TEXT",
+            "ai_status": "ALTER TABLE media_scenes ADD COLUMN ai_status TEXT DEFAULT 'pending'",
+            "is_favorite": "ALTER TABLE media_scenes ADD COLUMN is_favorite INTEGER DEFAULT 0",
+            "updated_at": "ALTER TABLE media_scenes ADD COLUMN updated_at TIMESTAMP",
+        }
+        for column, sql in migrations.items():
+            if column not in columns:
+                self.db.execute(sql)
+
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_media_id ON media_scenes(media_id)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_number ON media_scenes(media_id, scene_number)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_type ON media_scenes(scene_type)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_favorite ON media_scenes(is_favorite)")
+        self.db.commit()
 
     def create_import_session(self, session_id: str, folder_path: str) -> int:
         """Criar nova sessão de importação.
@@ -832,6 +896,374 @@ class SQLiteMediaRepository:
         except Exception as exc:
             logger.error("Erro ao deletar arquivo: %s", exc, exc_info=True)
             raise
+
+    def clear_scenes_for_media(self, media_id: Any) -> int:
+        """Remover cenas detectadas de uma mídia."""
+        media_id_value = self._media_id_value(media_id)
+        cursor = self.db.execute("DELETE FROM media_scenes WHERE media_id = ?", (media_id_value,))
+        self.db.commit()
+        return int(cursor.rowcount)
+
+    def save_detected_scenes(self, media_id: Any, scenes: List[Dict[str, Any]], threshold: float = 0.35) -> int:
+        """Salvar cenas detectadas, substituindo detecções anteriores da mídia."""
+        media_id_value = self._media_id_value(media_id)
+        self.clear_scenes_for_media(media_id_value)
+
+        for index, scene in enumerate(scenes, start=1):
+            self.db.execute(
+                """INSERT INTO media_scenes (
+                    media_id, scene_number, start_seconds, end_seconds,
+                    duration_seconds, custom_start_seconds, custom_end_seconds,
+                    custom_duration_seconds, detection_threshold, status,
+                    description, tags, scene_type, thumbnail_path,
+                    analysis_frames_json, ai_status, is_favorite, notes, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    media_id_value,
+                    int(scene.get("scene_number") or index),
+                    float(scene.get("start_seconds") or 0.0),
+                    float(scene.get("end_seconds") or 0.0),
+                    float(scene.get("duration_seconds") or 0.0),
+                    scene.get("custom_start_seconds"),
+                    scene.get("custom_end_seconds"),
+                    scene.get("custom_duration_seconds"),
+                    float(threshold),
+                    str(scene.get("status") or "detected"),
+                    scene.get("description"),
+                    scene.get("tags"),
+                    scene.get("scene_type") or "Geral",
+                    scene.get("thumbnail_path"),
+                    scene.get("analysis_frames_json"),
+                    scene.get("ai_status") or "pending",
+                    1 if scene.get("is_favorite") else 0,
+                    scene.get("notes"),
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+
+        self.db.execute(
+            "UPDATE media_files SET status = ? WHERE id = ?",
+            (ProcessingStatus.SCENES_COMPLETED.value, media_id_value),
+        )
+        self.db.commit()
+        return len(scenes)
+
+    def get_scenes_by_media(self, media_id: Any) -> List[Dict[str, Any]]:
+        """Listar cenas detectadas de uma mídia."""
+        media_id_value = self._media_id_value(media_id)
+        cursor = self.db.execute(
+            """SELECT id, media_id, scene_number, start_seconds, end_seconds,
+                      duration_seconds, custom_start_seconds, custom_end_seconds,
+                      custom_duration_seconds, is_merged, source_scene_ids,
+                      segments_json, display_name, detection_threshold, status,
+                      description, tags, scene_type, thumbnail_path,
+                      analysis_frames_json, ai_status, is_favorite,
+                      notes, created_at, updated_at
+               FROM media_scenes
+               WHERE media_id = ?
+               ORDER BY scene_number ASC""",
+            (media_id_value,),
+        )
+        columns = [
+            "id", "media_id", "scene_number", "start_seconds", "end_seconds",
+            "duration_seconds", "custom_start_seconds", "custom_end_seconds",
+            "custom_duration_seconds", "is_merged", "source_scene_ids",
+            "segments_json", "display_name", "detection_threshold", "status", "description",
+            "tags", "scene_type", "thumbnail_path", "analysis_frames_json",
+            "ai_status", "is_favorite", "notes", "created_at", "updated_at",
+        ]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+    def create_merged_scene(self, media_id: Any, source_scenes: List[Dict[str, Any]], display_name: Optional[str] = None) -> Dict[str, Any]:
+        """Criar um clipe rascunho juntando cenas/trechos selecionados.
+
+        O vídeo original não é alterado e nenhum MP4 é exportado aqui. O registro
+        salvo em `media_scenes` representa um item composto, com `segments_json`
+        guardando os trechos que deverão ser tocados/exportados em sequência.
+        """
+        media_id_value = self._media_id_value(media_id)
+        clean_scenes = [scene for scene in source_scenes if scene]
+        if len(clean_scenes) < 2:
+            raise ValueError("Selecione duas ou mais cenas para juntar.")
+
+        def effective_bounds(scene: Dict[str, Any]) -> tuple[float, float]:
+            start = scene.get("custom_start_seconds")
+            end = scene.get("custom_end_seconds")
+            if start is None:
+                start = scene.get("start_seconds") or 0.0
+            if end is None:
+                end = scene.get("end_seconds") or start
+            start = float(start or 0.0)
+            end = float(end or start)
+            if end <= start:
+                end = start + 0.25
+            return start, end
+
+        clean_scenes.sort(key=lambda item: effective_bounds(item)[0])
+        segments = []
+        for scene in clean_scenes:
+            start, end = effective_bounds(scene)
+            segments.append({
+                "scene_id": scene.get("id"),
+                "scene_number": scene.get("scene_number"),
+                "start_seconds": start,
+                "end_seconds": end,
+                "duration_seconds": max(end - start, 0.0),
+            })
+
+        total_duration = sum(float(segment["duration_seconds"]) for segment in segments)
+        start_seconds = float(segments[0]["start_seconds"])
+        end_seconds = float(segments[-1]["end_seconds"])
+        source_ids = [scene.get("id") for scene in clean_scenes]
+
+        row = self.db.execute(
+            "SELECT COALESCE(MAX(scene_number), 0) + 1 FROM media_scenes WHERE media_id = ?",
+            (media_id_value,),
+        ).fetchone()
+        scene_number = int(row[0] if row else 1)
+        display_name = (display_name or f"Clipe {scene_number:03d} (juntado)").strip() or f"Clipe {scene_number:03d} (juntado)"
+
+        tag_values: list[str] = []
+        for scene in clean_scenes:
+            for raw_tag in str(scene.get("tags") or "").replace(";", ",").split(","):
+                tag = raw_tag.strip()
+                if tag and tag.lower() not in {existing.lower() for existing in tag_values}:
+                    tag_values.append(tag)
+
+        descriptions = []
+        for scene in clean_scenes:
+            text = str(scene.get("description") or "").strip()
+            if text:
+                descriptions.append(f"Cena {int(scene.get('scene_number') or 0):03d}: {text}")
+        description = "\n".join(descriptions) or f"Clipe juntado com {len(clean_scenes)} cenas selecionadas."
+        thumbnail_path = clean_scenes[0].get("thumbnail_path")
+
+        self.db.execute(
+            """INSERT INTO media_scenes (
+                media_id, scene_number, start_seconds, end_seconds,
+                duration_seconds, custom_start_seconds, custom_end_seconds,
+                custom_duration_seconds, is_merged, source_scene_ids,
+                segments_json, display_name, detection_threshold, status,
+                description, tags, scene_type, thumbnail_path,
+                analysis_frames_json, ai_status, is_favorite, notes, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                media_id_value,
+                scene_number,
+                start_seconds,
+                end_seconds,
+                total_duration,
+                None,
+                None,
+                total_duration,
+                1,
+                json.dumps(source_ids, ensure_ascii=False),
+                json.dumps(segments, ensure_ascii=False),
+                display_name,
+                0.0,
+                "merged_draft",
+                description,
+                ", ".join(tag_values),
+                "Clipe juntado",
+                thumbnail_path,
+                None,
+                "manual_edit",
+                0,
+                f"Clipe rascunho criado a partir de {len(clean_scenes)} cena(s).",
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        self.db.commit()
+
+        scenes = self.get_scenes_by_media(media_id_value)
+        for scene in scenes:
+            if int(scene.get("scene_number") or 0) == scene_number:
+                return scene
+        raise RuntimeError("Clipe juntado foi salvo, mas não pôde ser recarregado.")
+
+    def create_cut_scene(
+        self,
+        media_id: Any,
+        source_scene: Dict[str, Any],
+        start_seconds: float,
+        end_seconds: float,
+        display_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Criar uma nova marcação de corte sem alterar a cena original.
+
+        O arquivo final ainda não é gerado aqui. Este método apenas salva um
+        novo item em `media_scenes`, com início/fim próprios, para que a
+        exportação em MP4 seja feita depois na Sprint 3.2.
+        """
+        media_id_value = self._media_id_value(media_id)
+        start = float(start_seconds or 0.0)
+        end = float(end_seconds or start)
+        if end <= start:
+            raise ValueError("O fim do corte precisa ser maior que o início.")
+
+        source_id = source_scene.get("id")
+        source_name = source_scene.get("display_name") or f"Cena {int(source_scene.get('scene_number') or 0):03d}"
+
+        row = self.db.execute(
+            "SELECT COALESCE(MAX(scene_number), 0) + 1 FROM media_scenes WHERE media_id = ?",
+            (media_id_value,),
+        ).fetchone()
+        scene_number = int(row[0] if row else 1)
+        display_name = (display_name or f"{source_name} - corte").strip() or f"{source_name} - corte"
+        duration = max(end - start, 0.0)
+
+        description = str(source_scene.get("description") or "").strip()
+        if description:
+            description = f"Recorte de {source_name}: {description}"
+        else:
+            description = f"Recorte criado a partir de {source_name}."
+
+        segment = {
+            "scene_id": source_id,
+            "scene_number": source_scene.get("scene_number"),
+            "start_seconds": start,
+            "end_seconds": end,
+            "duration_seconds": duration,
+        }
+
+        self.db.execute(
+            """INSERT INTO media_scenes (
+                media_id, scene_number, start_seconds, end_seconds,
+                duration_seconds, custom_start_seconds, custom_end_seconds,
+                custom_duration_seconds, is_merged, source_scene_ids,
+                segments_json, display_name, detection_threshold, status,
+                description, tags, scene_type, thumbnail_path,
+                analysis_frames_json, ai_status, is_favorite, notes, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                media_id_value,
+                scene_number,
+                start,
+                end,
+                duration,
+                None,
+                None,
+                duration,
+                0,
+                json.dumps([source_id], ensure_ascii=False),
+                json.dumps([segment], ensure_ascii=False),
+                display_name,
+                float(source_scene.get("detection_threshold") or 0.0),
+                "cut_draft",
+                description,
+                source_scene.get("tags"),
+                source_scene.get("scene_type") or "Geral",
+                source_scene.get("thumbnail_path"),
+                source_scene.get("analysis_frames_json"),
+                "manual_edit",
+                0,
+                f"Marcação de corte criada a partir de {source_name}.",
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        self.db.commit()
+
+        scenes = self.get_scenes_by_media(media_id_value)
+        for scene in scenes:
+            if int(scene.get("scene_number") or 0) == scene_number:
+                return scene
+        raise RuntimeError("Marcação de corte foi salva, mas não pôde ser recarregada.")
+
+
+    def get_scene_count(self, media_id: Any) -> int:
+        """Contar cenas detectadas de uma mídia."""
+        media_id_value = self._media_id_value(media_id)
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM media_scenes WHERE media_id = ?",
+            (media_id_value,),
+        ).fetchone()
+        return int(row[0] if row else 0)
+
+    def delete_scene(self, scene_id: Any) -> bool:
+        """Excluir uma cena detectada."""
+        scene_id_value = scene_id.value if hasattr(scene_id, "value") else int(scene_id)
+        cursor = self.db.execute("DELETE FROM media_scenes WHERE id = ?", (scene_id_value,))
+        self.db.commit()
+        return cursor.rowcount > 0
+
+    def update_scene_catalog(
+        self,
+        scene_id: Any,
+        description: str,
+        tags: str,
+        scene_type: str,
+        is_favorite: bool = False,
+        notes: Optional[str] = None,
+    ) -> bool:
+        """Atualizar descrição, tags, tipo e destaque de uma cena."""
+        scene_id_value = scene_id.value if hasattr(scene_id, "value") else int(scene_id)
+        cursor = self.db.execute(
+            """UPDATE media_scenes
+               SET description = ?, tags = ?, scene_type = ?, is_favorite = ?,
+                   notes = COALESCE(?, notes), ai_status = ?, updated_at = ?
+               WHERE id = ?""",
+            (
+                (description or "").strip(),
+                (tags or "").strip(),
+                (scene_type or "Geral").strip() or "Geral",
+                1 if is_favorite else 0,
+                notes,
+                "manual_edit",
+                datetime.utcnow().isoformat(),
+                scene_id_value,
+            ),
+        )
+        self.db.commit()
+        return cursor.rowcount > 0
+
+    def update_scene_trim(self, scene_id: Any, start_seconds: Optional[float], end_seconds: Optional[float]) -> bool:
+        """Salvar ajuste manual de início/fim de uma cena.
+
+        Quando start/end forem None, o corte customizado é resetado.
+        O vídeo original não é alterado; esses valores são usados apenas para
+        preview e futura criação/exportação do clipe.
+        """
+        scene_id_value = scene_id.value if hasattr(scene_id, "value") else int(scene_id)
+        if start_seconds is None or end_seconds is None:
+            cursor = self.db.execute(
+                """UPDATE media_scenes
+                   SET custom_start_seconds = NULL,
+                       custom_end_seconds = NULL,
+                       custom_duration_seconds = NULL,
+                       updated_at = ?
+                   WHERE id = ?""",
+                (datetime.utcnow().isoformat(), scene_id_value),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
+
+        start = float(start_seconds)
+        end = float(end_seconds)
+        if end <= start:
+            raise ValueError("O fim do corte precisa ser maior que o início.")
+
+        cursor = self.db.execute(
+            """UPDATE media_scenes
+               SET custom_start_seconds = ?,
+                   custom_end_seconds = ?,
+                   custom_duration_seconds = ?,
+                   updated_at = ?
+               WHERE id = ?""",
+            (start, end, end - start, datetime.utcnow().isoformat(), scene_id_value),
+        )
+        self.db.commit()
+        return cursor.rowcount > 0
+
+    def update_scene_favorite(self, scene_id: Any, is_favorite: bool) -> bool:
+        """Marcar/desmarcar cena como destaque."""
+        scene_id_value = scene_id.value if hasattr(scene_id, "value") else int(scene_id)
+        cursor = self.db.execute(
+            "UPDATE media_scenes SET is_favorite = ?, updated_at = ? WHERE id = ?",
+            (1 if is_favorite else 0, datetime.utcnow().isoformat(), scene_id_value),
+        )
+        self.db.commit()
+        return cursor.rowcount > 0
 
     def update_status(self, media_id: MediaId, status: ProcessingStatus) -> bool:
         try:

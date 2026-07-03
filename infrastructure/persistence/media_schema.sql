@@ -81,3 +81,35 @@ CREATE INDEX IF NOT EXISTS idx_media_library_folder_season ON media_files(librar
 CREATE INDEX IF NOT EXISTS idx_seasons_folder ON media_seasons(folder_name);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON import_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON import_sessions(started_at);
+
+-- Sprint 3.1/3.1.1: Cenas detectadas, miniaturas e catálogo inicial
+CREATE TABLE IF NOT EXISTS media_scenes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_id INTEGER NOT NULL,
+    scene_number INTEGER NOT NULL,
+    start_seconds REAL NOT NULL,
+    end_seconds REAL NOT NULL,
+    duration_seconds REAL NOT NULL,
+    custom_start_seconds REAL,
+    custom_end_seconds REAL,
+    custom_duration_seconds REAL,
+    detection_threshold REAL DEFAULT 0.35,
+    status TEXT DEFAULT 'detected',
+    description TEXT,
+    tags TEXT,
+    scene_type TEXT DEFAULT 'Geral',
+    thumbnail_path TEXT,
+    analysis_frames_json TEXT,
+    ai_status TEXT DEFAULT 'pending',
+    is_favorite INTEGER DEFAULT 0,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP,
+    FOREIGN KEY (media_id) REFERENCES media_files(id) ON DELETE CASCADE,
+    UNIQUE(media_id, scene_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_scenes_media_id ON media_scenes(media_id);
+CREATE INDEX IF NOT EXISTS idx_media_scenes_number ON media_scenes(media_id, scene_number);
+CREATE INDEX IF NOT EXISTS idx_media_scenes_type ON media_scenes(scene_type);
+CREATE INDEX IF NOT EXISTS idx_media_scenes_favorite ON media_scenes(is_favorite);
