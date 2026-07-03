@@ -21,7 +21,11 @@ from application.media.import_orchestrator import ImportOrchestrator
 from application.task_management import TaskScheduler, TaskQueue
 from infrastructure.persistence.sqlite_media_repository import SQLiteMediaRepository
 from application.media.media_pipeline import MediaPipeline
-from application.shared.event_bus import EventBus
+from application.event_bus import EventBus
+from infrastructure.config.configuration_service import ConfigurationService
+from infrastructure.media.media_scanner import MediaScanner
+from infrastructure.media.media_validator import MediaValidator
+from infrastructure.media.media_analyzer import FFprobeAnalyzer
 from presentation.views.media_library_view import MediaLibraryView
 
 
@@ -85,8 +89,19 @@ class MainWindow(QMainWindow):
             # Event Bus
             self.event_bus = EventBus()
             
-            # Media Pipeline (mock para desenvolvimento)
-            self.media_pipeline = MediaPipeline()
+            # Configuração e pipeline de mídia
+            config_service = ConfigurationService()
+            media_scanner = MediaScanner(config_service)
+            media_validator = MediaValidator()
+            media_analyzer = FFprobeAnalyzer(config_service)
+            self.media_pipeline = MediaPipeline(
+                scanner=media_scanner,
+                validator=media_validator,
+                analyzer=media_analyzer,
+                repository=self.repository,
+                event_bus=self.event_bus,
+                config=config_service,
+            )
             
             # ImportOrchestrator
             self.orchestrator = ImportOrchestrator(

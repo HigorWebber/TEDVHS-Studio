@@ -13,7 +13,7 @@ from application.media.media_pipeline import MediaPipeline
 from application.task_management import TaskScheduler, Task, TaskStatus, TaskPriority
 from infrastructure.persistence.sqlite_media_repository import SQLiteMediaRepository
 from domain.media.processing_status import ProcessingStatus
-from application.shared.event_bus import EventBus
+from application.event_bus import EventBus
 
 
 logger = logging.getLogger(__name__)

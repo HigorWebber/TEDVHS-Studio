@@ -94,7 +94,7 @@ def validate_imports() -> bool:
         from presentation.views.media_library_view import MediaLibraryView
         from application.media.media_pipeline import MediaPipeline
         from application.task_management import TaskScheduler, TaskQueue
-        from application.shared.event_bus import EventBus
+        from application.event_bus import EventBus
         
         print("[+] Todos os imports validados com sucesso")
         return True

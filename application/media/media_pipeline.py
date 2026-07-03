@@ -26,7 +26,7 @@ from infrastructure.media.hash_calculator import HashCalculator
 from infrastructure.media.media_analyzer import FFprobeAnalyzer
 from infrastructure.media.media_repository import IMediaRepository
 
-from application.shared.event_bus import EventBus
+from application.event_bus import EventBus
 from infrastructure.config.configuration_service import ConfigurationService
 
 

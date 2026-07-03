@@ -10,7 +10,7 @@ from application.media.media_pipeline import MediaPipeline
 from application.task_management import TaskScheduler, TaskQueue
 from infrastructure.persistence.sqlite_media_repository import SQLiteMediaRepository
 from core.database.connection import DatabaseConnection
-from application.shared.event_bus import EventBus
+from application.event_bus import EventBus
 
 
 @pytest.fixture
