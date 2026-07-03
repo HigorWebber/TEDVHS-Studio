@@ -29,6 +29,7 @@ from infrastructure.media.media_analyzer import FFprobeAnalyzer
 from infrastructure.media.scene_detector import SceneDetector
 from presentation.views.media_library_view import MediaLibraryView
 from presentation.views.scene_detection_view import SceneDetectionView
+from presentation.views.clip_library_view import ClipLibraryView
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ class MainWindow(QMainWindow):
         self.media_library_view: Optional[MediaLibraryView] = None
         self.scene_detector: Optional[SceneDetector] = None
         self.scene_detection_view: Optional[SceneDetectionView] = None
+        self.clip_library_view: Optional[ClipLibraryView] = None
         
         # Inicializar controller
         self.controller = MainController(DatabaseConnection())
@@ -152,6 +154,15 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.tabs.addTab(self.scene_detection_view, "🎬 Cenas Detectadas")
+
+        # Aba: Biblioteca de Clipes
+        self.clip_library_view = ClipLibraryView(
+            self.repository,
+            parent=self,
+        )
+        self.tabs.addTab(self.clip_library_view, "🎞️ Biblioteca de Clipes")
+
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         
         # Aba: Configurações (placeholder)
         settings_widget = QWidget()
@@ -162,6 +173,17 @@ class MainWindow(QMainWindow):
         
         main_layout.addWidget(self.tabs)
     
+    def _on_tab_changed(self, index: int) -> None:
+        """Ações ao trocar de aba."""
+        try:
+            if self.scene_detection_view and self.tabs.widget(index) is not self.scene_detection_view:
+                if hasattr(self.scene_detection_view, "player"):
+                    self.scene_detection_view.player.pause()
+            if self.clip_library_view and self.tabs.widget(index) is self.clip_library_view:
+                self.clip_library_view.refresh_clips()
+        except Exception as exc:
+            logger.warning("Erro ao processar troca de aba: %s", exc)
+
     def _setup_menu(self) -> None:
         """Configurar menu bar."""
         menubar = self.menuBar()

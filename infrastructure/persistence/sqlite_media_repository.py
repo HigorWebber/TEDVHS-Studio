@@ -1384,6 +1384,68 @@ class SQLiteMediaRepository:
         ]
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
+
+    def get_exported_clips_all(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """Listar todos os clipes exportados em MP4."""
+        cursor = self.db.execute(
+            """SELECT id, media_id, scene_id, clip_name, output_path, metadata_path,
+                      library_folder, library_season, episode_name, duration_seconds,
+                      segments_json, description, tags, scene_type, export_mode, status, created_at, updated_at
+               FROM exported_clips
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            (int(limit or 1000),),
+        )
+        columns = [
+            "id", "media_id", "scene_id", "clip_name", "output_path", "metadata_path",
+            "library_folder", "library_season", "episode_name", "duration_seconds",
+            "segments_json", "description", "tags", "scene_type", "export_mode", "status", "created_at", "updated_at",
+        ]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def update_exported_clip(
+        self,
+        clip_id: int,
+        clip_name: Optional[str] = None,
+        output_path: Optional[str] = None,
+        metadata_path: Optional[str] = None,
+        description: Optional[str] = None,
+        tags: Optional[str] = None,
+        scene_type: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> bool:
+        """Atualizar dados editáveis de um clipe exportado."""
+        fields = []
+        values: List[Any] = []
+        mapping = {
+            "clip_name": clip_name,
+            "output_path": output_path,
+            "metadata_path": metadata_path,
+            "description": description,
+            "tags": tags,
+            "scene_type": scene_type,
+            "status": status,
+        }
+        for column, value in mapping.items():
+            if value is not None:
+                fields.append(f"{column} = ?")
+                values.append(value)
+        fields.append("updated_at = ?")
+        values.append(datetime.utcnow().isoformat())
+        values.append(int(clip_id))
+        cursor = self.db.execute(
+            f"UPDATE exported_clips SET {', '.join(fields)} WHERE id = ?",
+            tuple(values),
+        )
+        self.db.commit()
+        return cursor.rowcount > 0
+
+    def delete_exported_clip(self, clip_id: int) -> bool:
+        """Remover o registro de um clipe exportado do banco."""
+        cursor = self.db.execute("DELETE FROM exported_clips WHERE id = ?", (int(clip_id),))
+        self.db.commit()
+        return cursor.rowcount > 0
+
     def update_status(self, media_id: MediaId, status: ProcessingStatus) -> bool:
         try:
             cursor = self.db.execute(
