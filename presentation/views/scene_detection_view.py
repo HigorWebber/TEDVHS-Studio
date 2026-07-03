@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -38,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from infrastructure.media.scene_detector import SceneDetector
+from infrastructure.media.clip_exporter import ClipExporter
 from infrastructure.persistence.sqlite_media_repository import SQLiteMediaRepository
 
 
@@ -66,6 +69,7 @@ class SceneDetectionView(QWidget):
         super().__init__(parent)
         self.repository = repository
         self.scene_detector = scene_detector
+        self.clip_exporter = ClipExporter()
         self._media_by_combo_index: dict[int, object] = {}
         self._scenes_by_row: dict[int, Dict[str, Any]] = {}
         self._selected_scene: Optional[Dict[str, Any]] = None
@@ -351,9 +355,14 @@ class SceneDetectionView(QWidget):
         controls_layout.addWidget(self.forward_btn)
 
         self.join_preview_btn = QPushButton("Juntar em clipe rascunho")
-        self.join_preview_btn.setToolTip("Cria um único item rascunho na lista, juntando as cenas selecionadas. Exportação em MP4 vem na Sprint 3.2.")
+        self.join_preview_btn.setToolTip("Cria um único item rascunho na lista, juntando as cenas selecionadas antes de exportar.")
         self.join_preview_btn.clicked.connect(self._play_selected_scenes_joined)
         controls_layout.addWidget(self.join_preview_btn)
+
+        self.export_selected_btn = QPushButton("Exportar MP4")
+        self.export_selected_btn.setToolTip("Exporta a cena/clipe selecionado com corte preciso em MP4.")
+        self.export_selected_btn.clicked.connect(self._export_selected_scenes)
+        controls_layout.addWidget(self.export_selected_btn)
 
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
@@ -490,9 +499,10 @@ class SceneDetectionView(QWidget):
         trim_actions.addStretch()
         trim_layout.addLayout(trim_actions)
 
-        self.create_clip_btn = QPushButton("Criar clipe (Sprint 3.2)")
-        self.create_clip_btn.setEnabled(False)
-        self.create_clip_btn.setToolTip("A geração de .mp4 entra na próxima sprint.")
+        self.create_clip_btn = QPushButton("Exportar corte/clipe em MP4")
+        self.create_clip_btn.setEnabled(True)
+        self.create_clip_btn.setToolTip("Exporta a marcação selecionada usando FFmpeg com corte preciso.")
+        self.create_clip_btn.clicked.connect(self._export_selected_scenes)
         trim_layout.addWidget(self.create_clip_btn)
         trim_layout.addStretch()
         return tab
@@ -1317,6 +1327,182 @@ class SceneDetectionView(QWidget):
         except Exception as exc:
             logger.error("Erro ao resetar corte da cena: %s", exc, exc_info=True)
             QMessageBox.critical(self, "Erro ao resetar corte", str(exc))
+
+    def _selected_scene_items_for_export(self) -> list[Dict[str, Any]]:
+        """Retornar cenas selecionadas para exportação.
+
+        Se nada estiver selecionado além do item atual, usa a cena ativa.
+        """
+        selected_rows = self._selected_rows()
+        scenes = [self._scenes_by_row[row] for row in selected_rows if row in self._scenes_by_row]
+        if not scenes and self._selected_scene:
+            scenes = [self._selected_scene]
+        return scenes
+
+    def _default_export_name(self, scenes: list[Dict[str, Any]]) -> str:
+        if len(scenes) == 1:
+            scene = scenes[0]
+            return str(scene.get("display_name") or f"Cena {int(scene.get('scene_number') or 0):03d}").strip()
+        return f"clipe_compilado_{len(scenes)}_cenas"
+
+    def _segments_for_export(self, scenes: list[Dict[str, Any]]) -> list[tuple[float, float]]:
+        """Converter cenas selecionadas em segmentos de segundos para FFmpeg."""
+        if not scenes:
+            return []
+        # Quando o item selecionado é um clipe rascunho/juntado, seus segmentos internos já definem a ordem.
+        if len(scenes) == 1:
+            segments_ms = self._segments_for_scene(scenes[0])
+        else:
+            scenes = sorted(scenes, key=lambda item: float(item.get("start_seconds") or 0.0))
+            segments_ms = []
+            for scene in scenes:
+                segments_ms.extend(self._segments_for_scene(scene))
+        return [(start / 1000.0, end / 1000.0) for start, end in segments_ms if end > start]
+
+    def _export_selected_scenes(self) -> None:
+        """Exportar cena, corte ou clipe rascunho selecionado para MP4.
+
+        A exportação é precisa e cria o arquivo somente agora. Antes disso, tudo
+        continua sendo apenas marcação no banco.
+        """
+        media = self._selected_media
+        if not media:
+            QMessageBox.information(self, "Exportar clipe", "Selecione um episódio primeiro.")
+            return
+
+        scenes = self._selected_scene_items_for_export()
+        if not scenes:
+            QMessageBox.information(self, "Exportar clipe", "Selecione uma cena, corte ou clipe rascunho.")
+            return
+
+        segments = self._segments_for_export(scenes)
+        if not segments:
+            QMessageBox.warning(self, "Exportar clipe", "Não há trechos válidos para exportar.")
+            return
+
+        source_path = Path(str(media.file_info.file_path))
+        if not source_path.exists():
+            QMessageBox.critical(self, "Arquivo não encontrado", f"O episódio original não foi encontrado:\n{source_path}")
+            return
+
+        default_name = self._default_export_name(scenes)
+        library_folder = str(media.custom_metadata.get("library_folder") or "Sem pasta")
+        safe_folder = self.clip_exporter.sanitize_component(library_folder, "Sem pasta")
+        destination_dir = self.clip_exporter.export_root / safe_folder / "Clipes"
+        destination_preview = f"{safe_folder} > Clipes"
+
+        clip_name, ok_name = QInputDialog.getText(
+            self,
+            "Nome do clipe final",
+            "Digite o nome do clipe que será exportado em MP4:\n\n"
+            f"Destino na biblioteca de exportação:\n{destination_preview}\n\n"
+            f"Caminho completo:\n{destination_dir}\n\n"
+            "Se já existir um arquivo com esse nome, o TEDVHS Studio salvará como nome (1).mp4.",
+            text=default_name,
+        )
+        if not ok_name:
+            return
+        clip_name = (clip_name or default_name).strip() or default_name
+
+        total_duration = sum(end - start for start, end in segments)
+        reply = QMessageBox.question(
+            self,
+            "Exportar clipe em MP4?",
+            f"Exportar '{clip_name}' com corte preciso?\n\n"
+            f"Trechos: {len(segments)}\n"
+            f"Duração final aproximada: {self._format_time(total_duration)}\n\n"
+            "O vídeo original não será alterado.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        first_scene = scenes[0]
+        output_path = self.clip_exporter.build_output_path(media, first_scene, clip_name)
+        folder = str(media.custom_metadata.get("library_folder") or "Sem pasta")
+        source_season = str(media.custom_metadata.get("library_season") or "Sem temporada")
+        clips_season = "Clipes"
+        episode_name = str(media.file_info.file_name)
+        source_scene_ids = [scene.get("id") for scene in scenes if scene.get("id") is not None]
+        description_parts = [str(scene.get("description") or "").strip() for scene in scenes if str(scene.get("description") or "").strip()]
+        tag_values: list[str] = []
+        for scene in scenes:
+            for raw_tag in str(scene.get("tags") or "").replace(";", ",").split(","):
+                tag = raw_tag.strip()
+                if tag and tag.lower() not in {existing.lower() for existing in tag_values}:
+                    tag_values.append(tag)
+        scene_type = str(first_scene.get("scene_type") or "Geral")
+        metadata = {
+            "clip_name": clip_name,
+            "source_media_id": str(media.id),
+            "source_file": str(source_path),
+            "library_folder": folder,
+            "library_season": clips_season,
+            "source_library_season": source_season,
+            "source_episode_name": episode_name,
+            "episode_name": episode_name,
+            "source_scene_ids": source_scene_ids,
+            "scene_type": scene_type,
+            "tags": tag_values,
+            "description": "\n".join(description_parts),
+            "export_note": "Exportado pelo TEDVHS Studio com corte preciso via FFmpeg.",
+        }
+
+        self.export_selected_btn.setEnabled(False)
+        self.create_clip_btn.setEnabled(False)
+        self.status_label.setText(f"Exportando clipe: {clip_name}... aguarde.")
+        try:
+            result = self.clip_exporter.export_scene(
+                source_file=source_path,
+                segments=segments,
+                output_path=output_path,
+                metadata=metadata,
+            )
+            record_id = self.repository.save_exported_clip(
+                media_id=media.id,
+                scene_id=first_scene.get("id") if len(scenes) == 1 else None,
+                clip_name=clip_name,
+                output_path=result["output_path"],
+                metadata_path=result.get("metadata_path"),
+                library_folder=folder,
+                library_season=clips_season,
+                episode_name=episode_name,
+                duration_seconds=float(result.get("duration_seconds") or total_duration),
+                segments_json=json.dumps(result.get("segments") or [], ensure_ascii=False),
+                description="\n".join(description_parts),
+                tags=", ".join(tag_values),
+                scene_type=scene_type,
+                export_mode=str(result.get("export_mode") or "precise_ffmpeg_reencode"),
+            )
+            self.status_label.setText(f"Clipe exportado: {result['output_path']}")
+            message = (
+                f"Clipe exportado com sucesso!\n\n"
+                f"Arquivo:\n{result['output_path']}\n\n"
+                f"Metadados:\n{result.get('metadata_path')}\n\n"
+                f"Registro no banco: #{record_id}\n\n"
+                "Deseja abrir a pasta do clipe?"
+            )
+            open_reply = QMessageBox.question(self, "Exportação concluída", message, QMessageBox.Yes | QMessageBox.No)
+            if open_reply == QMessageBox.Yes:
+                self._open_path_in_explorer(Path(result["output_path"]).parent)
+        except Exception as exc:
+            logger.error("Erro ao exportar clipe: %s", exc, exc_info=True)
+            self.status_label.setText(f"Erro ao exportar clipe: {exc}")
+            QMessageBox.critical(self, "Erro ao exportar clipe", str(exc))
+        finally:
+            self.export_selected_btn.setEnabled(True)
+            self.create_clip_btn.setEnabled(True)
+
+    def _open_path_in_explorer(self, path: Path) -> None:
+        """Abrir pasta no explorador do sistema."""
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:
+            logger.warning("Não foi possível abrir a pasta exportada: %s", exc)
 
     def hideEvent(self, event) -> None:
         """Pausar o preview ao sair da aba/tela de cenas."""

@@ -55,6 +55,7 @@ class SQLiteMediaRepository:
             self._ensure_import_session_columns()
             self._ensure_library_folder_schema()
             self._ensure_scene_schema()
+            self._ensure_clip_export_schema()
             self._migrate_media_files_uniqueness_if_needed()
         except Exception as exc:
             logger.error("Erro ao garantir schema: %s", exc, exc_info=True)
@@ -265,6 +266,53 @@ class SQLiteMediaRepository:
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_number ON media_scenes(media_id, scene_number)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_type ON media_scenes(scene_type)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_favorite ON media_scenes(is_favorite)")
+        self.db.commit()
+
+    def _ensure_clip_export_schema(self) -> None:
+        """Criar tabela de clipes exportados em MP4."""
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS exported_clips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_id INTEGER NOT NULL,
+                scene_id INTEGER,
+                clip_name TEXT NOT NULL,
+                output_path TEXT NOT NULL,
+                metadata_path TEXT,
+                library_folder TEXT DEFAULT 'Sem pasta',
+                library_season TEXT DEFAULT 'Sem temporada',
+                episode_name TEXT,
+                duration_seconds REAL DEFAULT 0,
+                segments_json TEXT,
+                description TEXT,
+                tags TEXT,
+                scene_type TEXT,
+                export_mode TEXT DEFAULT 'precise_ffmpeg_reencode',
+                status TEXT DEFAULT 'exported',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP
+            )"""
+        )
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(exported_clips)").fetchall()}
+        migrations = {
+            "metadata_path": "ALTER TABLE exported_clips ADD COLUMN metadata_path TEXT",
+            "library_folder": "ALTER TABLE exported_clips ADD COLUMN library_folder TEXT DEFAULT 'Sem pasta'",
+            "library_season": "ALTER TABLE exported_clips ADD COLUMN library_season TEXT DEFAULT 'Sem temporada'",
+            "episode_name": "ALTER TABLE exported_clips ADD COLUMN episode_name TEXT",
+            "segments_json": "ALTER TABLE exported_clips ADD COLUMN segments_json TEXT",
+            "description": "ALTER TABLE exported_clips ADD COLUMN description TEXT",
+            "tags": "ALTER TABLE exported_clips ADD COLUMN tags TEXT",
+            "scene_type": "ALTER TABLE exported_clips ADD COLUMN scene_type TEXT",
+            "export_mode": "ALTER TABLE exported_clips ADD COLUMN export_mode TEXT DEFAULT 'precise_ffmpeg_reencode'",
+            "status": "ALTER TABLE exported_clips ADD COLUMN status TEXT DEFAULT 'exported'",
+            "updated_at": "ALTER TABLE exported_clips ADD COLUMN updated_at TIMESTAMP",
+        }
+        for column, sql in migrations.items():
+            if column not in columns:
+                self.db.execute(sql)
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_exported_clips_media_id ON exported_clips(media_id)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_exported_clips_scene_id ON exported_clips(scene_id)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_exported_clips_folder ON exported_clips(library_folder)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_exported_clips_created ON exported_clips(created_at)")
         self.db.commit()
 
     def create_import_session(self, session_id: str, folder_path: str) -> int:
@@ -1264,6 +1312,77 @@ class SQLiteMediaRepository:
         )
         self.db.commit()
         return cursor.rowcount > 0
+
+    def save_exported_clip(
+        self,
+        media_id: Any,
+        scene_id: Any,
+        clip_name: str,
+        output_path: str,
+        metadata_path: Optional[str],
+        library_folder: str,
+        library_season: str,
+        episode_name: str,
+        duration_seconds: float,
+        segments_json: str,
+        description: str = "",
+        tags: str = "",
+        scene_type: str = "",
+        export_mode: str = "precise_ffmpeg_reencode",
+    ) -> int:
+        """Registrar um clipe exportado em MP4."""
+        media_id_value = self._media_id_value(media_id)
+        scene_id_value = None
+        if scene_id is not None:
+            scene_id_value = int(scene_id.value if hasattr(scene_id, "value") else scene_id)
+
+        cursor = self.db.execute(
+            """INSERT INTO exported_clips (
+                media_id, scene_id, clip_name, output_path, metadata_path,
+                library_folder, library_season, episode_name, duration_seconds,
+                segments_json, description, tags, scene_type, export_mode,
+                status, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                media_id_value,
+                scene_id_value,
+                (clip_name or "clipe").strip(),
+                output_path,
+                metadata_path,
+                self._normalize_folder_name(library_folder),
+                self._normalize_season_name(library_season),
+                (episode_name or "").strip(),
+                float(duration_seconds or 0.0),
+                segments_json or "[]",
+                description or "",
+                tags or "",
+                scene_type or "",
+                export_mode or "precise_ffmpeg_reencode",
+                "exported",
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        self.db.commit()
+        return int(cursor.lastrowid)
+
+    def get_exported_clips_by_media(self, media_id: Any) -> List[Dict[str, Any]]:
+        """Listar clipes exportados de uma mídia."""
+        media_id_value = self._media_id_value(media_id)
+        cursor = self.db.execute(
+            """SELECT id, media_id, scene_id, clip_name, output_path, metadata_path,
+                      library_folder, library_season, episode_name, duration_seconds,
+                      segments_json, description, tags, scene_type, export_mode, status, created_at
+               FROM exported_clips
+               WHERE media_id = ?
+               ORDER BY created_at DESC""",
+            (media_id_value,),
+        )
+        columns = [
+            "id", "media_id", "scene_id", "clip_name", "output_path", "metadata_path",
+            "library_folder", "library_season", "episode_name", "duration_seconds",
+            "segments_json", "description", "tags", "scene_type", "export_mode", "status", "created_at",
+        ]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
     def update_status(self, media_id: MediaId, status: ProcessingStatus) -> bool:
         try:
