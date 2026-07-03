@@ -26,7 +26,9 @@ from infrastructure.config.configuration_service import ConfigurationService
 from infrastructure.media.media_scanner import MediaScanner
 from infrastructure.media.media_validator import MediaValidator
 from infrastructure.media.media_analyzer import FFprobeAnalyzer
+from infrastructure.media.scene_detector import SceneDetector
 from presentation.views.media_library_view import MediaLibraryView
+from presentation.views.scene_detection_view import SceneDetectionView
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,8 @@ class MainWindow(QMainWindow):
         self.event_bus: Optional[EventBus] = None
         self.config_service: Optional[ConfigurationService] = None
         self.media_library_view: Optional[MediaLibraryView] = None
+        self.scene_detector: Optional[SceneDetector] = None
+        self.scene_detection_view: Optional[SceneDetectionView] = None
         
         # Inicializar controller
         self.controller = MainController(DatabaseConnection())
@@ -64,7 +68,7 @@ class MainWindow(QMainWindow):
         self._setup_status_bar()
         
         # Aplicar configurações da janela
-        self.setWindowTitle("TEDVHS Studio - Importador de Biblioteca")
+        self.setWindowTitle("TEDVHS Studio - Biblioteca e Detecção de Cenas")
         self.setGeometry(100, 100, 1200, 800)
         
         logger.info("Janela principal inicializada com sucesso")
@@ -95,6 +99,7 @@ class MainWindow(QMainWindow):
             media_scanner = MediaScanner(self.config_service)
             media_validator = MediaValidator()
             media_analyzer = FFprobeAnalyzer(self.config_service)
+            self.scene_detector = SceneDetector(self.config_service)
             self.media_pipeline = MediaPipeline(
                 scanner=media_scanner,
                 validator=media_validator,
@@ -139,6 +144,14 @@ class MainWindow(QMainWindow):
             parent=self
         )
         self.tabs.addTab(self.media_library_view, "📚 Biblioteca de Mídia")
+
+        # Aba: Detecção de Cenas
+        self.scene_detection_view = SceneDetectionView(
+            self.repository,
+            self.scene_detector,
+            parent=self,
+        )
+        self.tabs.addTab(self.scene_detection_view, "🎬 Cenas Detectadas")
         
         # Aba: Configurações (placeholder)
         settings_widget = QWidget()

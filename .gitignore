@@ -139,3 +139,4 @@ logs/
 *.db-wal
 *.sqlite
 *.sqlite3
+data/
