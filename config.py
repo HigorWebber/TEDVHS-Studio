@@ -1,5 +1,6 @@
 """Configurações centrais da aplicação TEDVHS Studio."""
 
+import os
 from pathlib import Path
 
 
@@ -15,7 +16,7 @@ WINDOW_WIDTH = 1200
 WINDOW_HEIGHT = 800
 
 # Banco de dados
-DATABASE_PATH = DATA_DIR / "tedvhs_studio.db"
+DATABASE_PATH = Path(os.getenv("TEDVHS_DATABASE_PATH", str(DATA_DIR / "tedvhs_studio.db")))
 DATABASE_TIMEOUT = 30.0
 DATABASE_JOURNAL_MODE = "WAL"
 DATABASE_SYNCHRONOUS = "NORMAL"
