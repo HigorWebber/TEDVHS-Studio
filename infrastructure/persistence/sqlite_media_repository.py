@@ -1235,6 +1235,48 @@ class SQLiteMediaRepository:
         self.db.commit()
         return cursor.rowcount > 0
 
+
+    def update_scene_visual_catalog(
+        self,
+        scene_id: Any,
+        description: Optional[str] = None,
+        tags: Optional[str] = None,
+        scene_type: Optional[str] = None,
+        thumbnail_path: Optional[str] = None,
+        analysis_frames_json: Optional[str] = None,
+        ai_status: str = "auto_local",
+    ) -> bool:
+        """Atualizar miniatura e catálogo automático de uma cena.
+
+        Usado pela catalogação em segundo plano para evitar que a detecção
+        de cenas fique pesada demais. Não altera cortes manuais nem clipes
+        rascunho.
+        """
+        scene_id_value = scene_id.value if hasattr(scene_id, "value") else int(scene_id)
+        cursor = self.db.execute(
+            """UPDATE media_scenes
+               SET description = COALESCE(?, description),
+                   tags = COALESCE(?, tags),
+                   scene_type = COALESCE(?, scene_type),
+                   thumbnail_path = COALESCE(?, thumbnail_path),
+                   analysis_frames_json = COALESCE(?, analysis_frames_json),
+                   ai_status = ?,
+                   updated_at = ?
+               WHERE id = ?""",
+            (
+                description,
+                tags,
+                scene_type,
+                thumbnail_path,
+                analysis_frames_json,
+                ai_status or "auto_local",
+                datetime.utcnow().isoformat(),
+                scene_id_value,
+            ),
+        )
+        self.db.commit()
+        return cursor.rowcount > 0
+
     def update_scene_catalog(
         self,
         scene_id: Any,

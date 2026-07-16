@@ -5,17 +5,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, QUrl, QCoreApplication
+from PySide6.QtCore import Qt, QUrl, QCoreApplication, QObject, QThread, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractScrollArea,
+    QCheckBox,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
@@ -36,7 +38,248 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from infrastructure.ai.gemini_scene_ai_service import (
+    DEFAULT_GEMINI_MODEL,
+    GeminiSceneAIError,
+    GeminiSceneAIService,
+)
+from infrastructure.subtitles.hybrid_subtitle_service import (
+    DEFAULT_GEMINI_SUBTITLE_MODEL,
+    HybridSubtitleService,
+    SubtitleGenerationError,
+)
+from infrastructure.settings.api_settings import ApiSettingsStore
+
+
 logger = logging.getLogger(__name__)
+
+
+class _ClipAIWorker(QObject):
+    """Worker em QThread para analisar clipes exportados com Gemini API."""
+
+    progress = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, ai_service: GeminiSceneAIService, clips: List[Dict[str, Any]], api_key: str, model: str):
+        super().__init__()
+        self.ai_service = ai_service
+        self.clips = list(clips or [])
+        self.api_key = str(api_key or "").strip()
+        self.model = str(model or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def run(self) -> None:
+        try:
+            results: List[Dict[str, Any]] = []
+            total = len(self.clips)
+            for index, clip in enumerate(self.clips, start=1):
+                if self._cancel_requested:
+                    raise RuntimeError("Análise de clipes cancelada pelo usuário.")
+                clip_name = str(clip.get("clip_name") or "Clipe")
+                self.progress.emit(f"IA do clipe: extraindo frames de {clip_name} ({index}/{total})...")
+                frames = self._extract_clip_frames(clip)
+
+                if self._cancel_requested:
+                    raise RuntimeError("Análise de clipes cancelada pelo usuário.")
+                self.progress.emit(f"IA do clipe: analisando {clip_name} com {self.model} ({index}/{total})...")
+                ai_result = self.ai_service.describe_clip(
+                    frames,
+                    context=self._build_clip_context(clip),
+                    api_key=self.api_key,
+                    model=self.model,
+                )
+                results.append({
+                    "id": clip.get("id"),
+                    "clip_name": clip_name,
+                    "description": self.ai_service.format_description(ai_result),
+                    "tags": self.ai_service.normalize_tags(ai_result),
+                    "scene_type": self.ai_service.normalize_scene_type(ai_result),
+                    "analysis_payload": {
+                        "method": "gemini_api_clip_vision_safe",
+                        "model": self.model,
+                        "frames": [str(frame) for frame in frames],
+                        "ai_result": ai_result,
+                    },
+                })
+            self.finished.emit(results)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _extract_clip_frames(self, clip: Dict[str, Any]) -> List[Path]:
+        output_path = Path(str(clip.get("output_path") or ""))
+        if not output_path.exists():
+            raise RuntimeError(f"Arquivo do clipe não encontrado: {output_path}")
+
+        clip_id = str(clip.get("id") or self._sanitize_name(output_path.stem))
+        output_root = Path("data") / "clip_ai_frames" / clip_id
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        duration = float(clip.get("duration_seconds") or 0.0)
+        if duration <= 0:
+            sample_times = [1.0]
+        elif duration <= 8:
+            sample_times = [max(0.4, duration * 0.50)]
+        elif duration <= 25:
+            sample_times = [max(0.6, duration * 0.20), duration * 0.50, max(0.6, duration * 0.80)]
+        else:
+            sample_times = [max(1.0, duration * 0.15), duration * 0.50, max(1.0, duration * 0.85)]
+
+        ffmpeg_binary = os.environ.get("FFMPEG_BINARY", "ffmpeg")
+        frames: List[Path] = []
+        for idx, seconds in enumerate(sample_times, start=1):
+            if self._cancel_requested:
+                raise RuntimeError("Análise de clipes cancelada pelo usuário.")
+            seconds = max(0.0, min(float(seconds), max(duration - 0.2, 0.0))) if duration > 0 else max(0.0, float(seconds))
+            frame_path = output_root / f"frame_{idx:02d}.jpg"
+            cmd = [
+                ffmpeg_binary,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{seconds:.3f}",
+                "-i",
+                str(output_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=448:-2",
+                "-q:v",
+                "4",
+                str(frame_path),
+            ]
+            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+            if completed.returncode == 0 and frame_path.exists() and frame_path.stat().st_size > 0:
+                frames.append(frame_path)
+        if not frames:
+            raise RuntimeError("Não foi possível extrair frames do clipe para análise. Verifique FFmpeg e o arquivo MP4.")
+        return frames
+
+    def _build_clip_context(self, clip: Dict[str, Any]) -> Dict[str, Any]:
+        segments = self._segments_for_clip(clip)
+        start_text, end_text = self._segment_bounds_text(segments)
+        segment_lines = []
+        for idx, segment in enumerate(segments[:8], start=1):
+            start = self._format_time(float(segment.get("start_seconds") or 0.0))
+            end = self._format_time(float(segment.get("end_seconds") or 0.0))
+            segment_lines.append(f"{idx}. {start} até {end}")
+        if len(segments) > 8:
+            segment_lines.append(f"... e mais {len(segments) - 8} segmento(s)")
+
+        return {
+            "anime": clip.get("library_folder") or "Sem pasta",
+            "season": clip.get("source_library_season") or clip.get("library_season") or "Sem temporada",
+            "episode": clip.get("source_episode_name") or clip.get("episode_name") or "Sem episódio",
+            "clip_name": clip.get("clip_name") or "Clipe exportado",
+            "duration": self._format_time(float(clip.get("duration_seconds") or 0.0)),
+            "source_range": f"{start_text or '-'} → {end_text or '-'}",
+            "segments_summary": "\n".join(segment_lines) if segment_lines else "Sem segmentos detalhados",
+            "scene_notes": str(clip.get("description") or "")[:900],
+        }
+
+    def _segments_for_clip(self, clip: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw = clip.get("segments") or clip.get("segments_json")
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw or "[]")
+            except Exception:
+                parsed = []
+        elif isinstance(raw, list):
+            parsed = raw
+        else:
+            parsed = []
+        return [segment for segment in parsed if isinstance(segment, dict)]
+
+    def _segment_bounds_text(self, segments: List[Dict[str, Any]]) -> tuple[str, str]:
+        if not segments:
+            return "", ""
+        try:
+            start = float(segments[0].get("start_seconds") or 0.0)
+            end = float(segments[-1].get("end_seconds") or 0.0)
+            return self._format_time(start), self._format_time(end)
+        except Exception:
+            return "", ""
+
+    @staticmethod
+    def _sanitize_name(value: str) -> str:
+        import re
+        text = re.sub(r"[<>:\"/\\|?*]+", "-", str(value or "").strip())
+        text = re.sub(r"\s+", " ", text).strip(" .")
+        return text or "clipe"
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        seconds = max(float(seconds or 0.0), 0.0)
+        total_ms = int(round(seconds * 1000))
+        ms = total_ms % 1000
+        total_seconds = total_ms // 1000
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+
+
+class _ClipSubtitleWorker(QObject):
+    """Worker em QThread para gerar legenda PT-BR dos clipes."""
+
+    progress = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        subtitle_service: HybridSubtitleService,
+        clip: Dict[str, Any],
+        api_key: str,
+        model: str,
+        action: str = "generate",
+    ):
+        super().__init__()
+        self.subtitle_service = subtitle_service
+        self.clip = dict(clip or {})
+        self.api_key = str(api_key or "").strip()
+        self.model = str(model or DEFAULT_GEMINI_SUBTITLE_MODEL).strip() or DEFAULT_GEMINI_SUBTITLE_MODEL
+        self.action = str(action or "generate")
+
+    def run(self) -> None:
+        try:
+            clip_name = str(self.clip.get("clip_name") or "Clipe")
+            if self.action == "burn":
+                self.progress.emit(f"Exportando MP4 legendado: {clip_name}...")
+                subtitle_data = self._subtitle_data_from_clip(self.clip)
+                result = self.subtitle_service.export_with_burned_subtitle(
+                    self.clip,
+                    ass_path=subtitle_data.get("ass_path") or None,
+                )
+                result.update({"id": self.clip.get("id"), "action": "burn"})
+                self.finished.emit(result)
+                return
+
+            self.progress.emit(f"Gerando legenda PT-BR: {clip_name}...")
+            result = self.subtitle_service.generate_ptbr_subtitle(
+                self.clip,
+                api_key=self.api_key,
+                model=self.model,
+            )
+            result.update({"id": self.clip.get("id"), "action": "generate"})
+            self.finished.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _subtitle_data_from_clip(self, clip: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = clip.get("metadata_json") if isinstance(clip.get("metadata_json"), dict) else {}
+        subtitles = metadata.get("subtitles_ptbr") if isinstance(metadata.get("subtitles_ptbr"), dict) else {}
+        if subtitles:
+            return subtitles
+        return {
+            "srt_path": clip.get("subtitle_srt_path"),
+            "ass_path": clip.get("subtitle_ass_path"),
+        }
 
 
 class ClipLibraryView(QWidget):
@@ -49,6 +292,13 @@ class ClipLibraryView(QWidget):
         self._clips_by_row: Dict[int, Dict[str, Any]] = {}
         self._selected_clip: Optional[Dict[str, Any]] = None
         self._is_slider_pressed = False
+        self.ai_service = GeminiSceneAIService(timeout_seconds=120)
+        self.subtitle_service = HybridSubtitleService(timeout_seconds=180)
+        self.api_settings = ApiSettingsStore()
+        self._ai_thread: Optional[QThread] = None
+        self._ai_worker: Optional[_ClipAIWorker] = None
+        self._subtitle_thread: Optional[QThread] = None
+        self._subtitle_worker: Optional[_ClipSubtitleWorker] = None
         self._setup_ui()
         self.refresh_clips()
 
@@ -187,15 +437,116 @@ class ClipLibraryView(QWidget):
         info_layout.addWidget(QLabel("Descrição:"))
         self.description_edit = QTextEdit()
         self.description_edit.setPlaceholderText("Descrição do clipe exportado...")
-        self.description_edit.setMinimumHeight(130)
+        self.description_edit.setMinimumHeight(170)
+        self.description_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.description_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.description_edit.setLineWrapMode(QTextEdit.WidgetWidth)
         info_layout.addWidget(self.description_edit)
+
+        info_layout.addWidget(QLabel("Tipo do clipe:"))
+        self.clip_type_combo = QComboBox()
+        self.clip_type_combo.addItems([
+            "Geral", "Ação", "Luta", "Diálogo", "Comédia", "Drama",
+            "Suspense", "Romance", "Transformação", "Poder/Habilidade",
+            "Revelação", "Cena épica", "Exploração", "Introdução", "Outro",
+        ])
+        info_layout.addWidget(self.clip_type_combo)
+
         info_layout.addWidget(QLabel("Tags:"))
         self.tags_edit = QLineEdit()
         self.tags_edit.setPlaceholderText("Ex.: luta, tensão, diálogo")
         info_layout.addWidget(self.tags_edit)
-        self.save_metadata_btn = QPushButton("Salvar descrição/tags")
+
+        metadata_actions = QHBoxLayout()
+        self.save_metadata_btn = QPushButton("Salvar descrição/tags/tipo")
         self.save_metadata_btn.clicked.connect(self._save_clip_metadata)
-        info_layout.addWidget(self.save_metadata_btn)
+        metadata_actions.addWidget(self.save_metadata_btn)
+        metadata_actions.addStretch(1)
+        info_layout.addLayout(metadata_actions)
+
+        ai_group = QGroupBox("IA do clipe exportado")
+        ai_layout = QVBoxLayout(ai_group)
+        ai_help = QLabel(
+            "Use Gemini API para descrever o clipe final salvo. O app envia poucos frames comprimidos do MP4, sem pesar no PC."
+        )
+        ai_help.setWordWrap(True)
+        ai_layout.addWidget(ai_help)
+
+        api_layout = QHBoxLayout()
+        api_layout.addWidget(QLabel("API Key:"))
+        saved_key = self.api_settings.get_gemini_api_key() if hasattr(self, "api_settings") else ""
+        self.gemini_api_key_edit = QLineEdit(saved_key)
+        self.gemini_api_key_edit.setEchoMode(QLineEdit.Password)
+        self.gemini_api_key_edit.setPlaceholderText("Cole sua API Key do Gemini")
+        self.gemini_api_key_edit.setToolTip("Pode salvar localmente neste PC para usar em descrições e legendas.")
+        api_layout.addWidget(self.gemini_api_key_edit, 1)
+        ai_layout.addLayout(api_layout)
+
+        api_save_layout = QHBoxLayout()
+        self.save_api_key_checkbox = QCheckBox("Salvar chave neste PC")
+        self.save_api_key_checkbox.setChecked(bool(saved_key))
+        self.save_api_key_checkbox.setToolTip("Salva em data/settings/api_settings.json. É local, mas não criptografado.")
+        api_save_layout.addWidget(self.save_api_key_checkbox)
+        self.save_api_key_btn = QPushButton("Salvar chave")
+        self.save_api_key_btn.clicked.connect(self._save_gemini_settings_from_fields)
+        api_save_layout.addWidget(self.save_api_key_btn)
+        self.clear_api_key_btn = QPushButton("Apagar chave")
+        self.clear_api_key_btn.clicked.connect(self._clear_saved_gemini_api_key)
+        api_save_layout.addWidget(self.clear_api_key_btn)
+        api_save_layout.addStretch(1)
+        ai_layout.addLayout(api_save_layout)
+
+        model_layout = QHBoxLayout()
+        model_layout.addWidget(QLabel("Modelo:"))
+        saved_model = self.api_settings.get_gemini_model(DEFAULT_GEMINI_MODEL) if hasattr(self, "api_settings") else DEFAULT_GEMINI_MODEL
+        self.gemini_model_edit = QLineEdit(saved_model or DEFAULT_GEMINI_MODEL)
+        self.gemini_model_edit.setPlaceholderText(DEFAULT_GEMINI_MODEL)
+        model_layout.addWidget(self.gemini_model_edit, 1)
+        self.test_gemini_btn = QPushButton("Testar Gemini")
+        self.test_gemini_btn.clicked.connect(self._test_gemini_connection)
+        model_layout.addWidget(self.test_gemini_btn)
+        ai_layout.addLayout(model_layout)
+
+        ai_actions = QHBoxLayout()
+        self.analyze_clip_ai_btn = QPushButton("Analisar clipe com IA")
+        self.analyze_clip_ai_btn.clicked.connect(self._on_analyze_current_clip_ai)
+        ai_actions.addWidget(self.analyze_clip_ai_btn, 1)
+        self.analyze_selected_clips_ai_btn = QPushButton("IA nos clipes selecionados")
+        self.analyze_selected_clips_ai_btn.clicked.connect(self._on_analyze_selected_clips_ai)
+        ai_actions.addWidget(self.analyze_selected_clips_ai_btn, 1)
+        ai_layout.addLayout(ai_actions)
+
+        info_layout.addWidget(ai_group)
+
+        subtitle_group = QGroupBox("Legendas PT-BR")
+        subtitle_layout = QVBoxLayout(subtitle_group)
+        subtitle_help = QLabel(
+            "Gera a legenda final sempre em PT-BR. Fluxo: usa PT-BR do arquivo; se não tiver, traduz legenda existente; se não houver legenda, usa API pelo áudio."
+        )
+        subtitle_help.setWordWrap(True)
+        subtitle_layout.addWidget(subtitle_help)
+
+        self.subtitle_status_label = QLabel("Selecione um clipe para ver o status da legenda.")
+        self.subtitle_status_label.setWordWrap(True)
+        self.subtitle_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        subtitle_layout.addWidget(self.subtitle_status_label)
+
+        subtitle_actions = QHBoxLayout()
+        self.generate_subtitle_btn = QPushButton("Gerar legenda PT-BR")
+        self.generate_subtitle_btn.clicked.connect(self._on_generate_current_subtitle)
+        subtitle_actions.addWidget(self.generate_subtitle_btn, 1)
+        self.export_subtitled_btn = QPushButton("Exportar MP4 legendado")
+        self.export_subtitled_btn.clicked.connect(self._on_export_current_subtitled)
+        subtitle_actions.addWidget(self.export_subtitled_btn, 1)
+        subtitle_layout.addLayout(subtitle_actions)
+
+        subtitle_actions_2 = QHBoxLayout()
+        self.open_subtitle_btn = QPushButton("Abrir legenda")
+        self.open_subtitle_btn.clicked.connect(self._open_selected_subtitle)
+        subtitle_actions_2.addWidget(self.open_subtitle_btn, 1)
+        subtitle_layout.addLayout(subtitle_actions_2)
+
+        info_layout.addWidget(subtitle_group)
         right_layout.addWidget(info_group, 1)
 
         danger_layout = QHBoxLayout()
@@ -243,7 +594,8 @@ class ClipLibraryView(QWidget):
                     payload = json.load(file)
                 for key in (
                     "source_library_season", "source_episode_name", "source_file",
-                    "description", "tags", "scene_type", "segments", "export_mode"
+                    "description", "tags", "scene_type", "segments", "export_mode",
+                    "subtitles_ptbr", "subtitle_srt_path", "subtitle_ass_path", "legendado_path"
                 ):
                     if payload.get(key) and not data.get(key):
                         data[key] = payload.get(key)
@@ -387,6 +739,7 @@ class ClipLibraryView(QWidget):
             self.player.setSource(QUrl())
         self.description_edit.setPlainText(str(clip.get("description") or ""))
         self.tags_edit.setText(self._tags_text(clip))
+        self._set_combo_text(self.clip_type_combo, str(clip.get("scene_type") or "Geral"))
         start_text, end_text = self._segment_bounds_text(clip)
         segments = self._segments_for_clip(clip)
         segment_count = len(segments)
@@ -401,6 +754,7 @@ class ClipLibraryView(QWidget):
             f"Tipo: {clip.get('scene_type') or 'Geral'}\n"
             f"Arquivo: {clip.get('output_path') or ''}"
         )
+        self._update_subtitle_status_label(clip)
         self.current_time_label.setText("00:00:00.000")
         self.total_time_label.setText(self._format_time(float(clip.get("duration_seconds") or 0.0)))
         self.timeline_slider.setValue(0)
@@ -457,13 +811,15 @@ class ClipLibraryView(QWidget):
             return
         description = self.description_edit.toPlainText().strip()
         tags = self.tags_edit.text().strip()
+        scene_type = self.clip_type_combo.currentText().strip() if hasattr(self, "clip_type_combo") else str(clip.get("scene_type") or "Geral")
         try:
             self.repository.update_exported_clip(
                 int(clip["id"]),
                 description=description,
                 tags=tags,
+                scene_type=scene_type,
             )
-            self._update_metadata_json(clip, {"description": description, "tags": tags})
+            self._update_metadata_json(clip, {"description": description, "tags": tags, "scene_type": scene_type})
             self.status_label.setText("Descrição/tags salvas.")
             self.refresh_clips()
             self._select_clip_by_id(int(clip["id"]))
@@ -533,6 +889,12 @@ class ClipLibraryView(QWidget):
                     output_path.unlink()
                 if metadata_path.exists():
                     metadata_path.unlink()
+                for subtitle_path in self._subtitle_sidecar_paths(clip):
+                    if subtitle_path.exists():
+                        try:
+                            subtitle_path.unlink()
+                        except Exception:
+                            logger.warning("Não foi possível excluir arquivo lateral de legenda: %s", subtitle_path)
                 self.repository.delete_exported_clip(int(clip["id"]))
                 removed += 1
             except Exception as exc:
@@ -552,12 +914,406 @@ class ClipLibraryView(QWidget):
         menu.addSeparator()
         menu.addAction("Renomear clipe", self._rename_selected_clip)
         menu.addAction("Salvar descrição/tags", self._save_clip_metadata)
+        menu.addAction("Analisar clipe com IA", self._on_analyze_current_clip_ai)
+        menu.addAction("Gerar legenda PT-BR", self._on_generate_current_subtitle)
+        menu.addAction("Exportar MP4 legendado", self._on_export_current_subtitled)
         menu.addSeparator()
         menu.addAction("Excluir clipe", self._delete_selected_clips)
         menu.addSeparator()
         menu.addAction("Atualizar lista", self.refresh_clips)
         menu.exec(self.table.viewport().mapToGlobal(position))
 
+
+    def _on_generate_current_subtitle(self) -> None:
+        if not self._selected_clip:
+            QMessageBox.information(self, "Legenda PT-BR", "Selecione um clipe exportado para gerar legenda.")
+            return
+        self._start_subtitle_worker(self._selected_clip, action="generate")
+
+    def _on_export_current_subtitled(self) -> None:
+        if not self._selected_clip:
+            QMessageBox.information(self, "MP4 legendado", "Selecione um clipe exportado para exportar com legenda.")
+            return
+        subtitle_data = self._subtitle_data_for_clip(self._selected_clip)
+        ass_path = Path(str(subtitle_data.get("ass_path") or ""))
+        if not ass_path.exists():
+            QMessageBox.warning(
+                self,
+                "Legenda não encontrada",
+                "Gere a legenda PT-BR do clipe antes de exportar o MP4 legendado."
+            )
+            return
+        self._start_subtitle_worker(self._selected_clip, action="burn")
+
+    def _start_subtitle_worker(self, clip: Dict[str, Any], action: str = "generate") -> None:
+        if self._subtitle_thread is not None:
+            QMessageBox.information(self, "Legenda em andamento", "Aguarde a operação de legenda atual terminar.")
+            return
+        if self._ai_thread is not None:
+            QMessageBox.information(self, "IA em andamento", "Aguarde a análise por IA terminar antes de gerar legenda.")
+            return
+
+        api_key = self.gemini_api_key_edit.text().strip() if hasattr(self, "gemini_api_key_edit") else ""
+        model = self.gemini_model_edit.text().strip() if hasattr(self, "gemini_model_edit") else DEFAULT_GEMINI_MODEL
+        if not model:
+            model = DEFAULT_GEMINI_MODEL
+            self.gemini_model_edit.setText(model)
+        self._maybe_save_gemini_settings(api_key, model)
+
+        if action == "generate":
+            reply = QMessageBox.question(
+                self,
+                "Gerar legenda PT-BR?",
+                "O app tentará nesta ordem:\n\n"
+                "1. usar legenda PT-BR do arquivo original;\n"
+                "2. se só houver legenda em outro idioma, traduzir para PT-BR com Gemini;\n"
+                "3. se não houver legenda, transcrever/traduzir o áudio com Gemini.\n\n"
+                "Para tradução ou transcrição, a API Key do Gemini será necessária e consumirá cota gratuita.\n\n"
+                "Deseja continuar?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self._set_subtitle_buttons_enabled(False)
+        self.status_label.setText("Preparando legenda PT-BR...")
+        thread = QThread(self)
+        worker = _ClipSubtitleWorker(
+            subtitle_service=self.subtitle_service,
+            clip=clip,
+            api_key=api_key,
+            model=model,
+            action=action,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.status_label.setText)
+        worker.finished.connect(self._on_subtitle_finished)
+        worker.failed.connect(self._on_subtitle_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_subtitle_worker)
+        self._subtitle_thread = thread
+        self._subtitle_worker = worker
+        thread.start()
+
+    def _on_subtitle_finished(self, result: Dict[str, Any]) -> None:
+        clip = self._selected_clip
+        clip_id = result.get("id")
+        if result.get("action") == "burn":
+            legendado_path = result.get("legendado_path")
+            if clip:
+                self._update_metadata_json(clip, {"legendado_path": legendado_path})
+            self.status_label.setText(f"MP4 legendado exportado: {legendado_path}")
+            QMessageBox.information(self, "MP4 legendado", f"Vídeo legendado criado com sucesso:\n{legendado_path}")
+            self.refresh_clips()
+            if clip_id:
+                self._select_clip_by_id(int(clip_id))
+            self._set_subtitle_buttons_enabled(True)
+            return
+
+        subtitle_payload = {
+            "srt_path": result.get("srt_path"),
+            "ass_path": result.get("ass_path"),
+            "cue_count": result.get("cue_count"),
+            "source": result.get("source"),
+            "source_language": result.get("source_language"),
+            "source_codec": result.get("source_codec"),
+            "translated_to_ptbr": result.get("translated_to_ptbr"),
+            "transcribed_from_audio": result.get("transcribed_from_audio"),
+            "model": result.get("model"),
+            "status": result.get("status"),
+        }
+        if clip:
+            self._update_metadata_json(clip, {
+                "subtitles_ptbr": subtitle_payload,
+                "subtitle_srt_path": result.get("srt_path"),
+                "subtitle_ass_path": result.get("ass_path"),
+            })
+        self.status_label.setText(
+            f"Legenda PT-BR criada: {result.get('cue_count') or 0} fala(s). Fonte: {result.get('source') or 'auto'}"
+        )
+        QMessageBox.information(
+            self,
+            "Legenda PT-BR criada",
+            f"Legenda criada com sucesso.\n\n"
+            f"Fonte: {result.get('source') or 'auto'}\n"
+            f"Falas: {result.get('cue_count') or 0}\n"
+            f"SRT: {result.get('srt_path')}\n"
+            f"ASS: {result.get('ass_path')}"
+        )
+        self.refresh_clips()
+        if clip_id:
+            self._select_clip_by_id(int(clip_id))
+        self._set_subtitle_buttons_enabled(True)
+
+    def _on_subtitle_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "Legenda PT-BR", message)
+        self.status_label.setText(f"Legenda falhou: {message}")
+        self._set_subtitle_buttons_enabled(True)
+
+    def _clear_subtitle_worker(self) -> None:
+        self._subtitle_thread = None
+        self._subtitle_worker = None
+        self._set_subtitle_buttons_enabled(True)
+
+    def _set_subtitle_buttons_enabled(self, enabled: bool) -> None:
+        for attr in ("generate_subtitle_btn", "export_subtitled_btn", "open_subtitle_btn"):
+            button = getattr(self, attr, None)
+            if button is not None:
+                button.setEnabled(enabled)
+
+    def _subtitle_data_for_clip(self, clip: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = clip.get("metadata_json") if isinstance(clip.get("metadata_json"), dict) else {}
+        subtitles = metadata.get("subtitles_ptbr") if isinstance(metadata.get("subtitles_ptbr"), dict) else {}
+        if subtitles:
+            return subtitles
+        output_path = Path(str(clip.get("output_path") or ""))
+        direct_srt = output_path.with_name(f"{output_path.stem}.pt-BR.srt") if output_path else Path("")
+        direct_ass = output_path.with_name(f"{output_path.stem}.pt-BR.ass") if output_path else Path("")
+        return {
+            "srt_path": clip.get("subtitle_srt_path") or (str(direct_srt) if direct_srt.exists() else ""),
+            "ass_path": clip.get("subtitle_ass_path") or (str(direct_ass) if direct_ass.exists() else ""),
+            "source": subtitles.get("source") if isinstance(subtitles, dict) else "",
+            "cue_count": subtitles.get("cue_count") if isinstance(subtitles, dict) else "",
+        }
+
+    def _update_subtitle_status_label(self, clip: Dict[str, Any]) -> None:
+        label = getattr(self, "subtitle_status_label", None)
+        if label is None:
+            return
+        subtitle_data = self._subtitle_data_for_clip(clip)
+        srt = Path(str(subtitle_data.get("srt_path") or ""))
+        ass = Path(str(subtitle_data.get("ass_path") or ""))
+        if srt.exists() or ass.exists():
+            label.setText(
+                "Status: legenda PT-BR pronta.\n"
+                f"Fonte: {subtitle_data.get('source') or 'arquivo/API'}\n"
+                f"Falas: {subtitle_data.get('cue_count') or '-'}\n"
+                f"SRT: {srt if srt.exists() else '-'}\n"
+                f"ASS: {ass if ass.exists() else '-'}"
+            )
+        else:
+            source_file = str(clip.get("source_file") or "")
+            label.setText(
+                "Status: sem legenda PT-BR gerada para este clipe.\n"
+                "Clique em ‘Gerar legenda PT-BR’.\n"
+                f"Arquivo original: {source_file or 'não informado'}"
+            )
+
+    def _open_selected_subtitle(self) -> None:
+        clip = self._selected_clip
+        if not clip:
+            return
+        subtitle_data = self._subtitle_data_for_clip(clip)
+        candidates = [Path(str(subtitle_data.get("ass_path") or "")), Path(str(subtitle_data.get("srt_path") or ""))]
+        for path in candidates:
+            if path.exists():
+                self._open_path(path)
+                return
+        QMessageBox.information(self, "Legenda PT-BR", "Nenhuma legenda PT-BR foi encontrada para este clipe.")
+
+
+    def _on_analyze_current_clip_ai(self) -> None:
+        if not self._selected_clip:
+            QMessageBox.information(self, "IA do clipe", "Selecione um clipe exportado para analisar.")
+            return
+        self._start_clip_ai_worker([self._selected_clip])
+
+    def _on_analyze_selected_clips_ai(self) -> None:
+        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        clips = [self._clips_by_row[row.row()] for row in rows if row.row() in self._clips_by_row]
+        if not clips and self._selected_clip:
+            clips = [self._selected_clip]
+        if not clips:
+            QMessageBox.information(self, "IA do clipe", "Selecione um ou mais clipes na biblioteca.")
+            return
+        if len(clips) > 1:
+            reply = QMessageBox.question(
+                self,
+                "Usar IA nos clipes selecionados?",
+                f"Você selecionou {len(clips)} clipe(s).\n\n"
+                "Cada clipe usa uma chamada da Gemini API e consome cota gratuita. "
+                "O app enviará poucos frames comprimidos de cada MP4.\n\n"
+                "Deseja continuar?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No if len(clips) > 8 else QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        self._start_clip_ai_worker(clips)
+
+    def _start_clip_ai_worker(self, clips: List[Dict[str, Any]]) -> None:
+        if self._ai_thread is not None:
+            QMessageBox.information(self, "IA em andamento", "Aguarde a análise atual terminar antes de iniciar outra.")
+            return
+        api_key = self.gemini_api_key_edit.text().strip() if hasattr(self, "gemini_api_key_edit") else ""
+        if not api_key:
+            QMessageBox.warning(
+                self,
+                "API Key necessária",
+                "Cole sua API Key gratuita do Gemini no campo API Key antes de analisar o clipe."
+            )
+            return
+        model = self.gemini_model_edit.text().strip() if hasattr(self, "gemini_model_edit") else DEFAULT_GEMINI_MODEL
+        if not model:
+            model = DEFAULT_GEMINI_MODEL
+            self.gemini_model_edit.setText(model)
+        self._maybe_save_gemini_settings(api_key, model)
+
+        valid_clips = []
+        for clip in clips:
+            path = Path(str(clip.get("output_path") or ""))
+            if path.exists():
+                valid_clips.append(clip)
+        if not valid_clips:
+            QMessageBox.warning(self, "Arquivo não encontrado", "Nenhum clipe selecionado possui arquivo MP4 válido.")
+            return
+
+        self._set_ai_buttons_enabled(False)
+        self.status_label.setText(f"Preparando IA para {len(valid_clips)} clipe(s)...")
+        thread = QThread(self)
+        worker = _ClipAIWorker(
+            ai_service=self.ai_service,
+            clips=valid_clips,
+            api_key=api_key,
+            model=model,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.status_label.setText)
+        worker.finished.connect(self._on_clip_ai_finished)
+        worker.failed.connect(self._on_clip_ai_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_ai_worker)
+        self._ai_thread = thread
+        self._ai_worker = worker
+        thread.start()
+
+    def _on_clip_ai_finished(self, results: List[Dict[str, Any]]) -> None:
+        current_id = int(self._selected_clip.get("id")) if self._selected_clip and self._selected_clip.get("id") else None
+        updated = 0
+        for result in results:
+            clip_id = result.get("id")
+            if not clip_id:
+                continue
+            try:
+                self.repository.update_exported_clip(
+                    int(clip_id),
+                    description=result.get("description"),
+                    tags=result.get("tags"),
+                    scene_type=result.get("scene_type"),
+                    status="ai_described",
+                )
+                clip = next((item for item in self._all_clips if int(item.get("id") or -1) == int(clip_id)), None)
+                if clip:
+                    self._update_metadata_json(clip, {
+                        "description": result.get("description"),
+                        "tags": result.get("tags"),
+                        "scene_type": result.get("scene_type"),
+                        "ai_clip_analysis": result.get("analysis_payload"),
+                    })
+                updated += 1
+            except Exception as exc:
+                logger.error("Erro ao salvar IA do clipe %s: %s", clip_id, exc, exc_info=True)
+        self.status_label.setText(f"IA de clipes concluída: {updated} clipe(s) atualizado(s).")
+        self.refresh_clips()
+        if current_id is not None:
+            self._select_clip_by_id(current_id)
+        self._set_ai_buttons_enabled(True)
+
+    def _on_clip_ai_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "IA do clipe", message)
+        self.status_label.setText(f"IA do clipe falhou: {message}")
+        self._set_ai_buttons_enabled(True)
+
+    def _clear_ai_worker(self) -> None:
+        self._ai_thread = None
+        self._ai_worker = None
+        self._set_ai_buttons_enabled(True)
+
+    def _set_ai_buttons_enabled(self, enabled: bool) -> None:
+        for attr in ("analyze_clip_ai_btn", "analyze_selected_clips_ai_btn", "test_gemini_btn", "save_api_key_btn", "clear_api_key_btn", "save_api_key_checkbox"):
+            button = getattr(self, attr, None)
+            if button is not None:
+                button.setEnabled(enabled)
+
+    def _maybe_save_gemini_settings(self, api_key: str, model: str) -> None:
+        checkbox = getattr(self, "save_api_key_checkbox", None)
+        if checkbox is not None and checkbox.isChecked():
+            try:
+                self.api_settings.save_gemini(api_key=api_key, model=model)
+            except Exception as exc:
+                logger.warning("Não foi possível salvar a chave Gemini: %s", exc)
+
+    def _save_gemini_settings_from_fields(self) -> None:
+        api_key = self.gemini_api_key_edit.text().strip() if hasattr(self, "gemini_api_key_edit") else ""
+        model = self.gemini_model_edit.text().strip() if hasattr(self, "gemini_model_edit") else DEFAULT_GEMINI_MODEL
+        if not api_key:
+            QMessageBox.warning(self, "API Key vazia", "Cole uma API Key do Gemini antes de salvar.")
+            return
+        try:
+            self.api_settings.save_gemini(api_key=api_key, model=model)
+            if hasattr(self, "save_api_key_checkbox"):
+                self.save_api_key_checkbox.setChecked(True)
+            QMessageBox.information(self, "Chave salva", "API Key do Gemini salva localmente neste PC.")
+            self.status_label.setText("API Key do Gemini salva localmente.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Erro ao salvar", f"Não foi possível salvar a API Key:\n{exc}")
+
+    def _clear_saved_gemini_api_key(self) -> None:
+        try:
+            self.api_settings.clear_gemini_api_key()
+            if hasattr(self, "gemini_api_key_edit"):
+                self.gemini_api_key_edit.clear()
+            if hasattr(self, "save_api_key_checkbox"):
+                self.save_api_key_checkbox.setChecked(False)
+            QMessageBox.information(self, "Chave apagada", "API Key salva foi apagada deste PC.")
+            self.status_label.setText("API Key do Gemini apagada.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Erro ao apagar", f"Não foi possível apagar a API Key:\n{exc}")
+
+    def _test_gemini_connection(self) -> None:
+        api_key = self.gemini_api_key_edit.text().strip() if hasattr(self, "gemini_api_key_edit") else ""
+        model = self.gemini_model_edit.text().strip() if hasattr(self, "gemini_model_edit") else DEFAULT_GEMINI_MODEL
+        if not api_key:
+            QMessageBox.warning(self, "API Key necessária", "Cole sua API Key gratuita do Gemini no campo API Key.")
+            return
+        if not model:
+            model = DEFAULT_GEMINI_MODEL
+            self.gemini_model_edit.setText(model)
+        try:
+            self.status_label.setText("Testando Gemini API...")
+            result = self.ai_service.test_connection(api_key=api_key, model=model)
+            QMessageBox.information(
+                self,
+                "Gemini conectado",
+                "Gemini API respondeu corretamente.\n\n"
+                f"Modelo: {result.get('model') or model}\n"
+                f"Resposta: {result.get('response') or 'OK'}"
+            )
+            self.status_label.setText(f"Gemini OK. Modelo selecionado: {result.get('model') or model}")
+            self._maybe_save_gemini_settings(api_key, result.get('model') or model)
+        except GeminiSceneAIError as exc:
+            QMessageBox.warning(self, "Gemini não disponível", str(exc))
+            self.status_label.setText(f"Gemini não disponível: {exc}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Gemini não disponível", f"Não foi possível conectar à Gemini API: {exc}")
+            self.status_label.setText(f"Gemini não disponível: {exc}")
+
+    def _set_combo_text(self, combo: QComboBox, value: str) -> None:
+        text = str(value or "").strip() or "Geral"
+        index = combo.findText(text)
+        if index < 0:
+            combo.addItem(text)
+            index = combo.findText(text)
+        combo.setCurrentIndex(max(index, 0))
 
     def _release_player_file_handles(self) -> None:
         """Liberar o arquivo do player antes de renomear/excluir no Windows."""
@@ -614,6 +1370,27 @@ class ClipLibraryView(QWidget):
                 json.dump(payload, file, ensure_ascii=False, indent=2)
         except Exception as exc:
             logger.warning("Não foi possível atualizar JSON do clipe: %s", exc)
+
+    def _subtitle_sidecar_paths(self, clip: Dict[str, Any]) -> List[Path]:
+        output_path = Path(str(clip.get("output_path") or ""))
+        paths: List[Path] = []
+        if output_path.name:
+            paths.extend([
+                output_path.with_name(f"{output_path.stem}.pt-BR.srt"),
+                output_path.with_name(f"{output_path.stem}.pt-BR.ass"),
+                output_path.with_name(f"{output_path.stem} legendado.mp4"),
+            ])
+        subtitle_data = self._subtitle_data_for_clip(clip) if isinstance(clip, dict) else {}
+        for key in ("srt_path", "ass_path", "legendado_path"):
+            value = subtitle_data.get(key) or clip.get(key) if isinstance(clip, dict) else None
+            if value:
+                paths.append(Path(str(value)))
+        unique: List[Path] = []
+        for path in paths:
+            if path and path not in unique:
+                unique.append(path)
+        return unique
+
 
     @staticmethod
     def _sanitize_name(value: str) -> str:
