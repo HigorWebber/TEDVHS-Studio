@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
+    QApplication,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -47,6 +48,11 @@ from infrastructure.subtitles.hybrid_subtitle_service import (
     DEFAULT_GEMINI_SUBTITLE_MODEL,
     HybridSubtitleService,
     SubtitleGenerationError,
+)
+from infrastructure.ai.gemini_narration_service import (
+    DEFAULT_NARRATION_MODEL,
+    GeminiNarrationError,
+    GeminiNarrationService,
 )
 from infrastructure.settings.api_settings import ApiSettingsStore
 
@@ -282,6 +288,137 @@ class _ClipSubtitleWorker(QObject):
         }
 
 
+class _ClipNarrationWorker(QObject):
+    """Worker em QThread para gerar roteiro/narração de clipe com Gemini API."""
+
+    progress = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        narration_service: GeminiNarrationService,
+        clip: Dict[str, Any],
+        api_key: str,
+        model: str,
+        style: str,
+        length: str,
+    ):
+        super().__init__()
+        self.narration_service = narration_service
+        self.clip = dict(clip or {})
+        self.api_key = str(api_key or "").strip()
+        self.model = str(model or DEFAULT_NARRATION_MODEL).strip() or DEFAULT_NARRATION_MODEL
+        self.style = str(style or "Empolgado").strip() or "Empolgado"
+        self.length = str(length or "Médio").strip() or "Médio"
+
+    def run(self) -> None:
+        try:
+            clip_name = str(self.clip.get("clip_name") or "Clipe")
+            self.progress.emit(f"Gerando roteiro de narração: {clip_name}...")
+            context = self._build_context(self.clip)
+            context["style"] = self.style
+            context["length"] = self.length
+            result = self.narration_service.generate_clip_narration(
+                context=context,
+                api_key=self.api_key,
+                model=self.model,
+            )
+            self.finished.emit({
+                "id": self.clip.get("id"),
+                "clip_name": clip_name,
+                "model": self.model,
+                "style": self.style,
+                "length": self.length,
+                "result": result,
+            })
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _build_context(self, clip: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = self._metadata_for_clip(clip)
+        subtitle_text = self._read_subtitle_text(clip, metadata)
+        subtitles = metadata.get("subtitles_ptbr") if isinstance(metadata.get("subtitles_ptbr"), dict) else {}
+        return {
+            "anime": clip.get("library_folder") or metadata.get("library_folder") or "Anime não informado",
+            "season": clip.get("source_library_season") or clip.get("library_season") or metadata.get("source_library_season") or "Temporada não informada",
+            "episode": clip.get("source_episode_name") or clip.get("episode_name") or metadata.get("source_episode_name") or "Episódio não informado",
+            "clip_name": clip.get("clip_name") or metadata.get("clip_name") or "Clipe exportado",
+            "duration": self._format_time(float(clip.get("duration_seconds") or metadata.get("duration_seconds") or 0.0)),
+            "scene_type": clip.get("scene_type") or metadata.get("scene_type") or "Geral",
+            "tags": clip.get("tags") or metadata.get("tags") or "",
+            "description": clip.get("description") or metadata.get("description") or "",
+            "subtitle_text": subtitle_text,
+            "subtitle_source": subtitles.get("source") if isinstance(subtitles, dict) else "",
+            "subtitle_language": subtitles.get("source_language") if isinstance(subtitles, dict) else "",
+            "segments": metadata.get("segments") or clip.get("segments") or clip.get("segments_json") or [],
+        }
+
+    def _metadata_for_clip(self, clip: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = clip.get("metadata_json") if isinstance(clip.get("metadata_json"), dict) else {}
+        if metadata:
+            return dict(metadata)
+        metadata_path = Path(str(clip.get("metadata_path") or ""))
+        if metadata_path.exists():
+            try:
+                with open(metadata_path, "r", encoding="utf-8") as file:
+                    loaded = json.load(file)
+                if isinstance(loaded, dict):
+                    return loaded
+            except Exception:
+                return {}
+        return {}
+
+    def _read_subtitle_text(self, clip: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+        candidates: List[Path] = []
+        subtitles = metadata.get("subtitles_ptbr") if isinstance(metadata.get("subtitles_ptbr"), dict) else {}
+        for value in (
+            subtitles.get("srt_path") if isinstance(subtitles, dict) else None,
+            clip.get("subtitle_srt_path"),
+            metadata.get("subtitle_srt_path"),
+        ):
+            if value:
+                candidates.append(Path(str(value)))
+        output_path = Path(str(clip.get("output_path") or metadata.get("output_path") or ""))
+        if output_path.name:
+            candidates.append(output_path.with_name(f"{output_path.stem}.pt-BR.srt"))
+        for path in candidates:
+            if not path.exists() or path.stat().st_size <= 0:
+                continue
+            try:
+                raw = path.read_text(encoding="utf-8", errors="replace")
+                return self._srt_to_plain_text(raw)[:5000]
+            except Exception:
+                continue
+        return ""
+
+    def _srt_to_plain_text(self, raw: str) -> str:
+        lines: List[str] = []
+        for line in str(raw or "").splitlines():
+            clean = line.strip()
+            if not clean:
+                continue
+            if clean.isdigit():
+                continue
+            if "-->" in clean:
+                continue
+            if clean.startswith("{") and clean.endswith("}"):
+                continue
+            lines.append(clean)
+        joined = " ".join(lines)
+        while "  " in joined:
+            joined = joined.replace("  ", " ")
+        return joined.strip()
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        seconds = max(float(seconds or 0.0), 0.0)
+        total_seconds = int(round(seconds))
+        minutes = total_seconds // 60
+        secs = total_seconds % 60
+        return f"{minutes:02d}:{secs:02d}"
+
+
 class ClipLibraryView(QWidget):
     """Aba para visualizar, pré-visualizar e organizar clipes exportados."""
 
@@ -294,11 +431,14 @@ class ClipLibraryView(QWidget):
         self._is_slider_pressed = False
         self.ai_service = GeminiSceneAIService(timeout_seconds=120)
         self.subtitle_service = HybridSubtitleService(timeout_seconds=180)
+        self.narration_service = GeminiNarrationService(timeout_seconds=120)
         self.api_settings = ApiSettingsStore()
         self._ai_thread: Optional[QThread] = None
         self._ai_worker: Optional[_ClipAIWorker] = None
         self._subtitle_thread: Optional[QThread] = None
         self._subtitle_worker: Optional[_ClipSubtitleWorker] = None
+        self._narration_thread: Optional[QThread] = None
+        self._narration_worker: Optional[_ClipNarrationWorker] = None
         self._setup_ui()
         self.refresh_clips()
 
@@ -547,6 +687,85 @@ class ClipLibraryView(QWidget):
         subtitle_layout.addLayout(subtitle_actions_2)
 
         info_layout.addWidget(subtitle_group)
+
+        narration_group = QGroupBox("Roteiro e narração")
+        narration_layout = QVBoxLayout(narration_group)
+        narration_help = QLabel(
+            "Gera texto para narrador apresentar o anime/clipe. Usa descrição, tags e legenda PT-BR quando existir."
+        )
+        narration_help.setWordWrap(True)
+        narration_layout.addWidget(narration_help)
+
+        self.narration_status_label = QLabel("Selecione um clipe para ver o status do roteiro.")
+        self.narration_status_label.setWordWrap(True)
+        self.narration_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        narration_layout.addWidget(self.narration_status_label)
+
+        narration_options = QHBoxLayout()
+        narration_options.addWidget(QLabel("Estilo:"))
+        self.narration_style_combo = QComboBox()
+        self.narration_style_combo.addItems([
+            "Empolgado", "Misterioso", "Informativo", "Engraçado leve",
+            "Dramático", "Review/Indicação", "TEDVHS direto"
+        ])
+        narration_options.addWidget(self.narration_style_combo, 1)
+        narration_options.addWidget(QLabel("Tamanho:"))
+        self.narration_length_combo = QComboBox()
+        self.narration_length_combo.addItems([
+            "Curto 20-30s", "Médio 45-60s", "Longo 75-90s"
+        ])
+        narration_options.addWidget(self.narration_length_combo, 1)
+        narration_layout.addLayout(narration_options)
+
+        narration_layout.addWidget(QLabel("Roteiro para narrador:"))
+        self.narration_script_edit = QTextEdit()
+        self.narration_script_edit.setPlaceholderText("O roteiro gerado para a narração aparecerá aqui...")
+        self.narration_script_edit.setMinimumHeight(150)
+        self.narration_script_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.narration_script_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.narration_script_edit.setLineWrapMode(QTextEdit.WidgetWidth)
+        narration_layout.addWidget(self.narration_script_edit)
+
+        narration_layout.addWidget(QLabel("Título sugerido:"))
+        self.tiktok_title_edit = QLineEdit()
+        self.tiktok_title_edit.setPlaceholderText("Título curto para TikTok/Reels/Shorts")
+        narration_layout.addWidget(self.tiktok_title_edit)
+
+        narration_layout.addWidget(QLabel("Texto para publicação:"))
+        self.tiktok_caption_edit = QTextEdit()
+        self.tiktok_caption_edit.setPlaceholderText("Texto da publicação para copiar e colar...")
+        self.tiktok_caption_edit.setMinimumHeight(120)
+        self.tiktok_caption_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.tiktok_caption_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.tiktok_caption_edit.setLineWrapMode(QTextEdit.WidgetWidth)
+        narration_layout.addWidget(self.tiktok_caption_edit)
+
+        narration_layout.addWidget(QLabel("Hashtags:"))
+        self.narration_hashtags_edit = QLineEdit()
+        self.narration_hashtags_edit.setPlaceholderText("Até 5 hashtags, ex.: #anime #otaku #isekai #tedvhs #animes")
+        narration_layout.addWidget(self.narration_hashtags_edit)
+
+        narration_actions = QHBoxLayout()
+        self.generate_narration_btn = QPushButton("Gerar roteiro com IA")
+        self.generate_narration_btn.clicked.connect(self._on_generate_current_narration)
+        narration_actions.addWidget(self.generate_narration_btn, 1)
+        self.save_narration_btn = QPushButton("Salvar roteiro")
+        self.save_narration_btn.clicked.connect(self._save_narration_metadata)
+        narration_actions.addWidget(self.save_narration_btn, 1)
+        narration_layout.addLayout(narration_actions)
+
+        narration_actions_2 = QHBoxLayout()
+        self.copy_post_btn = QPushButton("Copiar post + hashtags")
+        self.copy_post_btn.setToolTip("Copia apenas o texto da publicação com as hashtags, pronto para colar no TikTok/Reels/Shorts.")
+        self.copy_post_btn.clicked.connect(self._copy_tiktok_post_package)
+        narration_actions_2.addWidget(self.copy_post_btn, 1)
+        self.copy_narration_btn = QPushButton("Copiar pacote completo")
+        self.copy_narration_btn.setToolTip("Copia título, roteiro, texto da publicação e hashtags.")
+        self.copy_narration_btn.clicked.connect(self._copy_narration_package)
+        narration_actions_2.addWidget(self.copy_narration_btn, 1)
+        narration_layout.addLayout(narration_actions_2)
+
+        info_layout.addWidget(narration_group)
         right_layout.addWidget(info_group, 1)
 
         danger_layout = QHBoxLayout()
@@ -595,7 +814,9 @@ class ClipLibraryView(QWidget):
                 for key in (
                     "source_library_season", "source_episode_name", "source_file",
                     "description", "tags", "scene_type", "segments", "export_mode",
-                    "subtitles_ptbr", "subtitle_srt_path", "subtitle_ass_path", "legendado_path"
+                    "subtitles_ptbr", "subtitle_srt_path", "subtitle_ass_path", "legendado_path",
+                    "narration_package", "narration_script", "narration_hook", "tiktok_title",
+                    "tiktok_caption", "hashtags", "narration_style", "narration_length"
                 ):
                     if payload.get(key) and not data.get(key):
                         data[key] = payload.get(key)
@@ -755,6 +976,7 @@ class ClipLibraryView(QWidget):
             f"Arquivo: {clip.get('output_path') or ''}"
         )
         self._update_subtitle_status_label(clip)
+        self._load_narration_fields(clip)
         self.current_time_label.setText("00:00:00.000")
         self.total_time_label.setText(self._format_time(float(clip.get("duration_seconds") or 0.0)))
         self.timeline_slider.setValue(0)
@@ -917,11 +1139,321 @@ class ClipLibraryView(QWidget):
         menu.addAction("Analisar clipe com IA", self._on_analyze_current_clip_ai)
         menu.addAction("Gerar legenda PT-BR", self._on_generate_current_subtitle)
         menu.addAction("Exportar MP4 legendado", self._on_export_current_subtitled)
+        menu.addAction("Gerar roteiro/narração", self._on_generate_current_narration)
+        menu.addAction("Salvar roteiro/narração", self._save_narration_metadata)
         menu.addSeparator()
         menu.addAction("Excluir clipe", self._delete_selected_clips)
         menu.addSeparator()
         menu.addAction("Atualizar lista", self.refresh_clips)
         menu.exec(self.table.viewport().mapToGlobal(position))
+
+
+    def _narration_data_for_clip(self, clip: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = clip.get("metadata_json") if isinstance(clip.get("metadata_json"), dict) else {}
+        package = metadata.get("narration_package") if isinstance(metadata.get("narration_package"), dict) else {}
+        if not package:
+            package = clip.get("narration_package") if isinstance(clip.get("narration_package"), dict) else {}
+        return {
+            "roteiro_narracao": package.get("roteiro_narracao") or clip.get("narration_script") or metadata.get("narration_script") or "",
+            "gancho": package.get("gancho") or clip.get("narration_hook") or metadata.get("narration_hook") or "",
+            "titulo_tiktok": package.get("titulo_tiktok") or clip.get("tiktok_title") or metadata.get("tiktok_title") or "",
+            "texto_tiktok": package.get("texto_tiktok") or clip.get("tiktok_caption") or metadata.get("tiktok_caption") or "",
+            "hashtags": package.get("hashtags") or clip.get("hashtags") or metadata.get("hashtags") or [],
+            "cta": package.get("cta") or metadata.get("cta") or "",
+            "estilo": package.get("estilo") or clip.get("narration_style") or metadata.get("narration_style") or "Empolgado",
+            "tamanho": package.get("tamanho") or clip.get("narration_length") or metadata.get("narration_length") or "Médio 45-60s",
+            "modelo": package.get("modelo") or metadata.get("narration_model") or "",
+        }
+
+    def _load_narration_fields(self, clip: Dict[str, Any]) -> None:
+        data = self._narration_data_for_clip(clip)
+        script = str(data.get("roteiro_narracao") or "")
+        title = str(data.get("titulo_tiktok") or "")
+        caption = str(data.get("texto_tiktok") or "")
+        hashtags = data.get("hashtags") or []
+        if isinstance(hashtags, list):
+            hashtags_text = " ".join(str(tag) for tag in hashtags)
+        else:
+            hashtags_text = str(hashtags or "")
+        if hasattr(self, "narration_script_edit"):
+            self.narration_script_edit.setPlainText(script)
+        if hasattr(self, "tiktok_title_edit"):
+            self.tiktok_title_edit.setText(title)
+        if hasattr(self, "tiktok_caption_edit"):
+            self.tiktok_caption_edit.setPlainText(caption)
+        if hasattr(self, "narration_hashtags_edit"):
+            self.narration_hashtags_edit.setText(hashtags_text)
+        if hasattr(self, "narration_style_combo"):
+            self._set_combo_text(self.narration_style_combo, str(data.get("estilo") or "Empolgado"))
+        if hasattr(self, "narration_length_combo"):
+            self._set_combo_text(self.narration_length_combo, str(data.get("tamanho") or "Médio 45-60s"))
+        self._update_narration_status_label(clip)
+
+    def _update_narration_status_label(self, clip: Dict[str, Any]) -> None:
+        label = getattr(self, "narration_status_label", None)
+        if label is None:
+            return
+        data = self._narration_data_for_clip(clip)
+        script = str(data.get("roteiro_narracao") or "").strip()
+        if script:
+            label.setText(
+                "Status: roteiro pronto para este clipe.\n"
+                f"Estilo: {data.get('estilo') or '-'} | Tamanho: {data.get('tamanho') or '-'}\n"
+                f"Modelo: {data.get('modelo') or '-'}"
+            )
+        else:
+            label.setText(
+                "Status: sem roteiro salvo para este clipe.\n"
+                "Clique em ‘Gerar roteiro com IA’ depois de ter descrição e, se possível, legenda PT-BR."
+            )
+
+    def _on_generate_current_narration(self) -> None:
+        if not self._selected_clip:
+            QMessageBox.information(self, "Roteiro de narração", "Selecione um clipe exportado para gerar roteiro.")
+            return
+        self._start_narration_worker(self._selected_clip)
+
+    def _start_narration_worker(self, clip: Dict[str, Any]) -> None:
+        if self._narration_thread is not None:
+            QMessageBox.information(self, "Roteiro em andamento", "Aguarde o roteiro atual terminar.")
+            return
+        if self._ai_thread is not None or self._subtitle_thread is not None:
+            QMessageBox.information(self, "Operação em andamento", "Aguarde a IA/legenda atual terminar antes de gerar roteiro.")
+            return
+        api_key = self.gemini_api_key_edit.text().strip() if hasattr(self, "gemini_api_key_edit") else ""
+        if not api_key:
+            QMessageBox.warning(self, "API Key necessária", "Cole sua API Key gratuita do Gemini antes de gerar o roteiro.")
+            return
+        model = self.gemini_model_edit.text().strip() if hasattr(self, "gemini_model_edit") else DEFAULT_NARRATION_MODEL
+        if not model:
+            model = DEFAULT_NARRATION_MODEL
+            self.gemini_model_edit.setText(model)
+        self._maybe_save_gemini_settings(api_key, model)
+
+        has_description = bool(str(clip.get("description") or "").strip())
+        subtitle_data = self._subtitle_data_for_clip(clip)
+        has_subtitle = Path(str(subtitle_data.get("srt_path") or "")).exists()
+        if not has_description and not has_subtitle:
+            reply = QMessageBox.question(
+                self,
+                "Gerar mesmo assim?",
+                "Este clipe ainda não tem descrição IA nem legenda PT-BR.\n\n"
+                "O roteiro pode ficar genérico. O ideal é analisar o clipe com IA ou gerar a legenda antes.\n\n"
+                "Deseja continuar mesmo assim?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        style = self.narration_style_combo.currentText().strip() if hasattr(self, "narration_style_combo") else "Empolgado"
+        length = self.narration_length_combo.currentText().strip() if hasattr(self, "narration_length_combo") else "Médio 45-60s"
+        self._set_narration_buttons_enabled(False)
+        self.status_label.setText("Preparando roteiro de narração...")
+        thread = QThread(self)
+        worker = _ClipNarrationWorker(
+            narration_service=self.narration_service,
+            clip=clip,
+            api_key=api_key,
+            model=model,
+            style=style,
+            length=length,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.status_label.setText)
+        worker.finished.connect(self._on_narration_finished)
+        worker.failed.connect(self._on_narration_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_narration_worker)
+        self._narration_thread = thread
+        self._narration_worker = worker
+        thread.start()
+
+    def _on_narration_finished(self, payload: Dict[str, Any]) -> None:
+        clip = self._selected_clip
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        if not result:
+            QMessageBox.warning(self, "Roteiro de narração", "A API respondeu, mas o roteiro veio vazio.")
+            self._set_narration_buttons_enabled(True)
+            return
+        if hasattr(self, "narration_script_edit"):
+            self.narration_script_edit.setPlainText(str(result.get("roteiro_narracao") or ""))
+        if hasattr(self, "tiktok_title_edit"):
+            self.tiktok_title_edit.setText(str(result.get("titulo_tiktok") or ""))
+        if hasattr(self, "tiktok_caption_edit"):
+            self.tiktok_caption_edit.setPlainText(str(result.get("texto_tiktok") or ""))
+        hashtags = result.get("hashtags") or []
+        hashtags_text = " ".join(str(tag) for tag in hashtags) if isinstance(hashtags, list) else str(hashtags or "")
+        if hasattr(self, "narration_hashtags_edit"):
+            self.narration_hashtags_edit.setText(hashtags_text)
+        if clip:
+            package = dict(result)
+            package.update({
+                "modelo": payload.get("model"),
+                "estilo": payload.get("style"),
+                "tamanho": payload.get("length"),
+            })
+            self._update_metadata_json(clip, {
+                "narration_package": package,
+                "narration_script": result.get("roteiro_narracao"),
+                "narration_hook": result.get("gancho"),
+                "tiktok_title": result.get("titulo_tiktok"),
+                "tiktok_caption": result.get("texto_tiktok"),
+                "hashtags": hashtags_text,
+                "narration_style": payload.get("style"),
+                "narration_length": payload.get("length"),
+                "narration_model": payload.get("model"),
+            })
+        self.status_label.setText("Roteiro de narração gerado e salvo no JSON do clipe.")
+        QMessageBox.information(self, "Roteiro pronto", "Roteiro de narração gerado com sucesso.")
+        current_id = int(clip.get("id")) if clip and clip.get("id") else None
+        self.refresh_clips()
+        if current_id is not None:
+            self._select_clip_by_id(current_id)
+        self._set_narration_buttons_enabled(True)
+
+    def _on_narration_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "Roteiro de narração", message)
+        self.status_label.setText(f"Roteiro falhou: {message}")
+        self._set_narration_buttons_enabled(True)
+
+    def _clear_narration_worker(self) -> None:
+        self._narration_thread = None
+        self._narration_worker = None
+        self._set_narration_buttons_enabled(True)
+
+    def _set_narration_buttons_enabled(self, enabled: bool) -> None:
+        for attr in ("generate_narration_btn", "save_narration_btn", "copy_narration_btn", "copy_post_btn"):
+            button = getattr(self, attr, None)
+            if button is not None:
+                button.setEnabled(enabled)
+
+    def _save_narration_metadata(self) -> None:
+        clip = self._selected_clip
+        if not clip:
+            return
+        script = self.narration_script_edit.toPlainText().strip() if hasattr(self, "narration_script_edit") else ""
+        title = self.tiktok_title_edit.text().strip() if hasattr(self, "tiktok_title_edit") else ""
+        caption = self.tiktok_caption_edit.toPlainText().strip() if hasattr(self, "tiktok_caption_edit") else ""
+        hashtags = self.narration_hashtags_edit.text().strip() if hasattr(self, "narration_hashtags_edit") else ""
+        style = self.narration_style_combo.currentText().strip() if hasattr(self, "narration_style_combo") else ""
+        length = self.narration_length_combo.currentText().strip() if hasattr(self, "narration_length_combo") else ""
+        package = {
+            "gancho": self._first_sentence(script),
+            "roteiro_narracao": script,
+            "titulo_tiktok": title,
+            "texto_tiktok": caption,
+            "hashtags": hashtags,
+            "estilo": style,
+            "tamanho": length,
+            "fonte": "manual",
+        }
+        try:
+            self._update_metadata_json(clip, {
+                "narration_package": package,
+                "narration_script": script,
+                "narration_hook": package.get("gancho"),
+                "tiktok_title": title,
+                "tiktok_caption": caption,
+                "hashtags": hashtags,
+                "narration_style": style,
+                "narration_length": length,
+            })
+            self.status_label.setText("Roteiro/narração salvo no JSON do clipe.")
+            QMessageBox.information(self, "Roteiro salvo", "Roteiro e texto de publicação salvos no JSON lateral do clipe.")
+            current_id = int(clip.get("id")) if clip.get("id") else None
+            self.refresh_clips()
+            if current_id is not None:
+                self._select_clip_by_id(current_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "Erro ao salvar roteiro", str(exc))
+
+    def _copy_tiktok_post_package(self) -> None:
+        """Copia somente o texto de postagem com hashtags para a área de transferência."""
+        caption = self.tiktok_caption_edit.toPlainText().strip() if hasattr(self, "tiktok_caption_edit") else ""
+        hashtags = self.narration_hashtags_edit.text().strip() if hasattr(self, "narration_hashtags_edit") else ""
+        post_text = self._compose_tiktok_post_text(caption, hashtags)
+        if not post_text:
+            QMessageBox.information(
+                self,
+                "Nada para copiar",
+                "Gere ou escreva o texto da publicação antes de copiar o post."
+            )
+            return
+        self._copy_text_to_clipboard(post_text, "Post com hashtags copiado para a área de transferência.")
+
+    def _copy_narration_package(self) -> None:
+        """Copia título, roteiro, texto de post e hashtags para a área de transferência."""
+        script = self.narration_script_edit.toPlainText().strip() if hasattr(self, "narration_script_edit") else ""
+        title = self.tiktok_title_edit.text().strip() if hasattr(self, "tiktok_title_edit") else ""
+        caption = self.tiktok_caption_edit.toPlainText().strip() if hasattr(self, "tiktok_caption_edit") else ""
+        hashtags = self.narration_hashtags_edit.text().strip() if hasattr(self, "narration_hashtags_edit") else ""
+        post_text = self._compose_tiktok_post_text(caption, hashtags)
+        package_parts = []
+        if title:
+            package_parts.append(f"TÍTULO:\n{title}")
+        if script:
+            package_parts.append(f"ROTEIRO/NARRAÇÃO:\n{script}")
+        if post_text:
+            package_parts.append(f"TEXTO DO POST COM HASHTAGS:\n{post_text}")
+        elif caption:
+            package_parts.append(f"TEXTO DO POST:\n{caption}")
+        elif hashtags:
+            package_parts.append(f"HASHTAGS:\n{hashtags}")
+        package = "\n\n".join(package_parts).strip()
+        if not package:
+            QMessageBox.information(
+                self,
+                "Nada para copiar",
+                "Gere ou escreva o roteiro/texto da publicação antes de copiar o pacote."
+            )
+            return
+        self._copy_text_to_clipboard(package, "Pacote completo copiado para a área de transferência.")
+
+    def _copy_text_to_clipboard(self, text: str, success_message: str) -> None:
+        text = str(text or "").strip()
+        if not text:
+            return
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        # Mantém o texto também no modo Selection quando existir, sem quebrar no Windows.
+        try:
+            if clipboard.supportsSelection():
+                clipboard.setText(text, clipboard.Mode.Selection)
+        except Exception:
+            pass
+        self.status_label.setText(success_message)
+        QMessageBox.information(self, "Copiado", success_message)
+
+    @staticmethod
+    def _compose_tiktok_post_text(caption: str, hashtags: str) -> str:
+        caption = str(caption or "").strip()
+        hashtags = " ".join(str(hashtags or "").replace("\n", " ").split()).strip()
+        if not caption:
+            return hashtags
+        if not hashtags:
+            return caption
+        # Evita duplicar hashtags caso a IA já tenha colocado no final do texto.
+        caption_lower = caption.lower()
+        hashtag_tokens = [tag for tag in hashtags.split() if tag.startswith("#")]
+        missing_tags = [tag for tag in hashtag_tokens if tag.lower() not in caption_lower]
+        if missing_tags:
+            return f"{caption}\n\n{' '.join(missing_tags)}".strip()
+        return caption
+
+    @staticmethod
+    def _first_sentence(text: str) -> str:
+        clean = str(text or "").strip()
+        if not clean:
+            return ""
+        for marker in (". ", "! ", "? ", "\n"):
+            if marker in clean:
+                return clean.split(marker, 1)[0].strip() + (marker.strip() if marker.strip() in ".!?" else "")
+        return clean[:160]
 
 
     def _on_generate_current_subtitle(self) -> None:
