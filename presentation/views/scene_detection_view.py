@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import json
 import os
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal, QItemSelectionModel
 from PySide6.QtGui import QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSizePolicy,
     QSplitter,
@@ -47,6 +50,43 @@ from infrastructure.settings.api_settings import ApiSettingsStore
 
 
 logger = logging.getLogger(__name__)
+
+
+def _friendly_gemini_error(message: object) -> str:
+    """Transformar erros longos da Gemini em mensagem curta e útil para a interface."""
+    raw = str(message or "").strip()
+    lower = raw.lower()
+
+    retry_hint = ""
+    retry_match = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", raw, flags=re.IGNORECASE)
+    if retry_match:
+        try:
+            seconds = float(retry_match.group(1))
+            if seconds >= 3600:
+                retry_hint = f"\n\nTente novamente em aproximadamente {seconds / 3600:.1f} hora(s)."
+            elif seconds >= 60:
+                retry_hint = f"\n\nTente novamente em aproximadamente {seconds / 60:.0f} minuto(s)."
+            else:
+                retry_hint = f"\n\nTente novamente em aproximadamente {seconds:.0f} segundo(s)."
+        except Exception:
+            retry_hint = ""
+
+    if "429" in lower or "resource_exhausted" in lower or "quota" in lower or "rate limit" in lower:
+        return (
+            "Limite gratuito da Gemini API atingido ou muitas chamadas em pouco tempo.\n\n"
+            "O app foi interrompido com segurança para não continuar gastando cota.\n"
+            "Use a busca local com as descrições já salvas ou aguarde a cota liberar."
+            f"{retry_hint}"
+        )
+    if "api key" in lower or "permission_denied" in lower or "unauthenticated" in lower:
+        return "A API Key da Gemini não foi aceita. Confira se a chave está correta e salva no app."
+    if "not_found" in lower or "model" in lower and "available" in lower:
+        return "Modelo Gemini indisponível para esta chave. Use gemini-3.1-flash-lite ou outro modelo disponível na sua conta."
+    if "timeout" in lower or "timed out" in lower:
+        return "A Gemini demorou demais para responder. Tente novamente com poucas cenas selecionadas."
+    if len(raw) > 600:
+        return raw[:600] + "..."
+    return raw or "Erro desconhecido na operação."
 
 
 class _SceneDetectionWorker(QObject):
@@ -125,9 +165,10 @@ class _SceneCatalogWorker(QObject):
 
 
 class _SceneAIWorker(QObject):
-    """Worker em QThread para descrição de cenas com Gemini API em modo seguro."""
+    """Worker em QThread para descrição/classificação de cenas com Gemini API em modo seguro."""
 
     progress = Signal(str)
+    partial = Signal(object)
     finished = Signal(object)
     failed = Signal(str)
 
@@ -152,7 +193,7 @@ class _SceneAIWorker(QObject):
         self.scenes = scenes
         self.api_key = str(api_key or "").strip()
         self.model = (model or "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
-        self.max_frames = max(1, min(int(max_frames or 1), 2))
+        self.max_frames = max(1, min(int(max_frames or 1), 3))
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -208,15 +249,17 @@ class _SceneAIWorker(QObject):
                     "frames": frames,
                     "ai_result": ai_result,
                 }
-                results.append({
+                result_payload = {
                     "id": scene.get("id"),
                     "description": description,
                     "tags": tags,
                     "scene_type": scene_type,
                     "analysis_frames_json": json.dumps(analysis_payload, ensure_ascii=False),
                     "ai_status": "gemini_api",
-                })
-                self.progress.emit(f"IA online segura: {display_name} concluída ({index}/{total}).")
+                }
+                results.append(result_payload)
+                self.partial.emit(result_payload)
+                self.progress.emit(f"IA online segura: {display_name} concluída ({index}/{total}). Resultado salvo.")
 
             self.finished.emit(results)
         except Exception as exc:
@@ -382,10 +425,17 @@ class SceneDetectionView(QWidget):
         self.catalog_selected_btn.clicked.connect(self._on_catalog_selected_clicked)
         settings_layout.addWidget(self.catalog_selected_btn)
 
-        self.ai_selected_top_btn = QPushButton("IA nas selecionadas")
+        self.classify_episode_btn = QPushButton("Criar índice inteligente")
+        self.classify_episode_btn.setToolTip(
+            "Analisa as cenas com Gemini usando início/meio/fim, salva descrição, tags e elementos visuais "
+            "para depois buscar por objetivos como explosão, luta, magia, paisagem ou emoção."
+        )
+        self.classify_episode_btn.clicked.connect(self._on_classify_episode_clicked)
+        settings_layout.addWidget(self.classify_episode_btn)
+
+        self.ai_selected_top_btn = QPushButton("IA selecionadas")
         self.ai_selected_top_btn.setToolTip(
-            "Usa Gemini API nas cenas selecionadas para gerar descrição, tags, tipo e potencial. "
-            "Não roda em todas sem confirmação."
+            "Usa Gemini API apenas nas cenas selecionadas. Útil para testar ou reclassificar poucas cenas."
         )
         self.ai_selected_top_btn.clicked.connect(self._on_generate_ai_selected_clicked)
         settings_layout.addWidget(self.ai_selected_top_btn)
@@ -416,6 +466,8 @@ class SceneDetectionView(QWidget):
 
         self.main_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setMinimumHeight(0)
+        self.main_splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.main_splitter.addWidget(self._create_scene_list_panel())
         self.main_splitter.addWidget(self._create_preview_panel())
         self.main_splitter.setStretchFactor(0, 1)
@@ -424,9 +476,31 @@ class SceneDetectionView(QWidget):
         root_layout.addWidget(self.main_splitter, stretch=1)
 
         self.setLayout(root_layout)
+
+    def _make_scrollable_panel(self, widget: QWidget) -> QScrollArea:
+        """Evitar que painéis altos forcem a janela para fora da tela.
+
+        Alguns layouts têm player, descrição, ações de IA e textos longos. Em telas
+        menores ou depois de maximizar/restaurar no Windows, o Qt pode respeitar a
+        altura mínima desses filhos e empurrar a parte inferior para fora da janela.
+        O scroll area mantém o painel dentro do limite visível e permite rolagem real.
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setMinimumHeight(0)
+        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        scroll.setWidget(widget)
+        return scroll
+
     def _create_scene_list_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setMinimumWidth(540)
+        panel.setMinimumWidth(500)
+        panel.setMinimumHeight(0)
+        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 6, 0)
         layout.setSpacing(4)
@@ -440,10 +514,76 @@ class SceneDetectionView(QWidget):
         hint.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         layout.addWidget(hint)
 
+        search_group = QGroupBox("Buscar cenas por objetivo")
+        search_layout = QVBoxLayout(search_group)
+        search_layout.setContentsMargins(8, 8, 8, 8)
+        search_layout.setSpacing(6)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Buscar:"))
+        self.scene_search_edit = QLineEdit()
+        self.scene_search_edit.setPlaceholderText("Ex.: cenas de explosão, luta com magia, paisagem bonita, protagonista assustado...")
+        self.scene_search_edit.setToolTip(
+            "Busca local no índice inteligente: descrição, tags, tipo, elementos visuais, emoção e potencial. "
+            "Use Criar índice inteligente antes para melhorar os resultados."
+        )
+        self.scene_search_edit.returnPressed.connect(self._apply_scene_search_filter)
+        search_row.addWidget(self.scene_search_edit, stretch=1)
+
+        self.apply_scene_search_btn = QPushButton("Buscar objetivo")
+        self.apply_scene_search_btn.clicked.connect(self._apply_scene_search_filter)
+        search_row.addWidget(self.apply_scene_search_btn)
+
+        self.clear_scene_search_btn = QPushButton("Limpar")
+        self.clear_scene_search_btn.clicked.connect(self._clear_scene_search_filter)
+        search_row.addWidget(self.clear_scene_search_btn)
+        search_layout.addLayout(search_row)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Sugestões:"))
+        self.scene_search_preset_combo = QComboBox()
+        self.scene_search_preset_combo.addItems([
+            "Escolher objetivo rápido...",
+            "cenas de explosão e fogo",
+            "cenas de luta e ação",
+            "cenas de magia e poder",
+            "cenas bonitas de paisagem",
+            "cenas engraçadas",
+            "cenas tristes ou emocionais",
+            "cenas de diálogo importante",
+            "cenas para apresentar o anime",
+            "cenas com alto potencial para TikTok",
+        ])
+        self.scene_search_preset_combo.currentTextChanged.connect(self._on_scene_search_preset_changed)
+        preset_row.addWidget(self.scene_search_preset_combo, stretch=1)
+        search_layout.addLayout(preset_row)
+
+        search_actions = QHBoxLayout()
+        self.select_search_results_btn = QPushButton("Selecionar resultados")
+        self.select_search_results_btn.setToolTip("Seleciona todas as cenas visíveis após a busca.")
+        self.select_search_results_btn.clicked.connect(self._select_search_results)
+        search_actions.addWidget(self.select_search_results_btn)
+
+        self.join_search_results_btn = QPushButton("Juntar resultados")
+        self.join_search_results_btn.setToolTip("Seleciona as cenas visíveis e cria um clipe rascunho com elas.")
+        self.join_search_results_btn.clicked.connect(self._join_search_results)
+        search_actions.addWidget(self.join_search_results_btn)
+        search_actions.addStretch()
+        search_layout.addLayout(search_actions)
+
+        search_hint = QLabel(
+            "Modo atual: busca local instantânea no índice inteligente. Pesquise como gente normal: "
+            "cenas de explosão, luta com magia, paisagem bonita, personagem assustado, cena engraçada etc."
+        )
+        search_hint.setWordWrap(True)
+        search_hint.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        search_layout.addWidget(search_hint)
+        layout.addWidget(search_group)
+
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
+        self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
-            "Miniatura", "Cena", "Início", "Fim", "Duração", "Tipo", "Tags", "Descrição", "★",
+            "Miniatura", "Cena", "Início", "Fim", "Duração", "Tipo", "Tags", "Descrição", "Match", "★",
         ])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -469,7 +609,8 @@ class SceneDetectionView(QWidget):
         self.table.setColumnWidth(5, 150)
         self.table.setColumnWidth(6, 220)
         self.table.setColumnWidth(7, 420)
-        self.table.setColumnWidth(8, 36)
+        self.table.setColumnWidth(8, 78)
+        self.table.setColumnWidth(9, 36)
         layout.addWidget(self.table, stretch=1)
         return panel
     def _create_preview_panel(self) -> QWidget:
@@ -481,7 +622,9 @@ class SceneDetectionView(QWidget):
         - isso evita que vídeo, descrição e botões disputem a mesma altura da janela.
         """
         panel = QWidget()
-        panel.setMinimumWidth(560)
+        panel.setMinimumWidth(500)
+        panel.setMinimumHeight(0)
+        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(6, 0, 0, 0)
         layout.setSpacing(6)
@@ -511,8 +654,8 @@ class SceneDetectionView(QWidget):
         layout.setSpacing(8)
 
         self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumHeight(300)
-        self.video_widget.setMaximumHeight(460)
+        self.video_widget.setMinimumHeight(190)
+        self.video_widget.setMaximumHeight(360)
         self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_widget.setStyleSheet("background: #050505; border: 1px solid #444444;")
         try:
@@ -634,7 +777,7 @@ class SceneDetectionView(QWidget):
         help_label.setStyleSheet("color: #aaaaaa;")
         layout.addWidget(help_label)
 
-        return tab
+        return self._make_scrollable_panel(tab)
 
     def _create_catalog_tab(self) -> QWidget:
         tab = QWidget()
@@ -651,7 +794,7 @@ class SceneDetectionView(QWidget):
 
         self.catalog_splitter = QSplitter(Qt.Vertical)
         self.catalog_splitter.setChildrenCollapsible(False)
-        self.catalog_splitter.setMinimumHeight(300)
+        self.catalog_splitter.setMinimumHeight(220)
 
         meta_panel = QWidget()
         meta_layout = QVBoxLayout(meta_panel)
@@ -690,8 +833,9 @@ class SceneDetectionView(QWidget):
         self.description_edit.setLineWrapMode(QTextEdit.WidgetWidth)
         self.description_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.description_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.description_edit.setMinimumHeight(260)
-        self.description_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.description_edit.setMinimumHeight(170)
+        self.description_edit.setMaximumHeight(360)
+        self.description_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.description_edit.setStyleSheet(
             "QTextEdit { padding: 8px; border: 1px solid #3c3c3c; background: #1f1f1f; }"
             "QTextEdit:focus { border: 1px solid #5a7ec8; }"
@@ -706,7 +850,7 @@ class SceneDetectionView(QWidget):
 
         self.catalog_splitter.setStretchFactor(0, 0)
         self.catalog_splitter.setStretchFactor(1, 1)
-        self.catalog_splitter.setSizes([105, 520])
+        self.catalog_splitter.setSizes([110, 300])
         outer_layout.addWidget(self.catalog_splitter, stretch=1)
 
         actions_group = QGroupBox("Ações e IA online")
@@ -775,7 +919,7 @@ class SceneDetectionView(QWidget):
         self.test_ollama_btn.clicked.connect(self._test_ollama_connection)
         actions_layout.addWidget(self.test_ollama_btn, 3, 2)
 
-        actions_hint = QLabel("Fluxo recomendado: detecte cenas → selecione as melhores → use IA nas selecionadas. Use Catalogar básico só para miniaturas/descrição local simples.")
+        actions_hint = QLabel("Fluxo recomendado: detecte cenas → crie o índice inteligente → pesquise por objetivo → selecione/junte resultados. Use IA selecionadas só para testar ou reclassificar poucas cenas.")
         actions_hint.setWordWrap(True)
         actions_hint.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         actions_layout.addWidget(actions_hint, 4, 0, 1, 3)
@@ -787,7 +931,7 @@ class SceneDetectionView(QWidget):
         actions_layout.setColumnStretch(2, 0)
         outer_layout.addWidget(actions_group, stretch=0)
 
-        return tab
+        return self._make_scrollable_panel(tab)
 
     def _create_trim_tab(self) -> QWidget:
         tab = QWidget()
@@ -852,7 +996,7 @@ class SceneDetectionView(QWidget):
         self.create_clip_btn.clicked.connect(self._export_selected_scenes)
         trim_layout.addWidget(self.create_clip_btn)
         trim_layout.addStretch()
-        return tab
+        return self._make_scrollable_panel(tab)
 
     def _create_info_tab(self) -> QWidget:
         tab = QWidget()
@@ -862,7 +1006,7 @@ class SceneDetectionView(QWidget):
 
         self.thumbnail_label = QLabel("Sem miniatura")
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
-        self.thumbnail_label.setMinimumSize(420, 236)
+        self.thumbnail_label.setMinimumSize(320, 180)
         self.thumbnail_label.setFrameShape(QFrame.Box)
         self.thumbnail_label.setStyleSheet("background: #181818; color: #cccccc;")
         info_layout.addWidget(self.thumbnail_label, stretch=2)
@@ -883,7 +1027,7 @@ class SceneDetectionView(QWidget):
         side_info.addStretch()
         info_layout.addLayout(side_info, stretch=1)
 
-        return tab
+        return self._make_scrollable_panel(tab)
 
     def _setup_player(self) -> None:
         self.player = QMediaPlayer(self)
@@ -992,6 +1136,61 @@ class SceneDetectionView(QWidget):
         media = self._selected_media_obj()
         return media.id if media else None
 
+    def _database_media_id(self, media: object) -> Optional[int]:
+        """Retornar o ID real da mídia no SQLite.
+
+        Em alguns fluxos depois de importar muitos episódios, o objeto em memória pode ficar
+        com um ID antigo/stale. Antes de salvar cenas, resolvemos o ID pelo caminho do arquivo
+        para evitar erro de FOREIGN KEY em media_scenes.
+        """
+        if not media:
+            return None
+
+        def _as_int(value: object) -> Optional[int]:
+            try:
+                raw = value.value if hasattr(value, "value") else value
+                if raw is None or raw == "":
+                    return None
+                return int(raw)
+            except Exception:
+                return None
+
+        candidate = _as_int(getattr(media, "id", None))
+        try:
+            if candidate is not None:
+                cur = self.repository.db.execute(
+                    "SELECT id FROM media_files WHERE id = ? LIMIT 1",
+                    (candidate,),
+                )
+                if cur.fetchone() is not None:
+                    return candidate
+        except Exception:
+            pass
+
+        file_path = str(getattr(getattr(media, "file_info", None), "file_path", "") or "")
+        if file_path:
+            try:
+                cur = self.repository.db.execute(
+                    "SELECT id FROM media_files WHERE file_path = ? ORDER BY id DESC LIMIT 1",
+                    (file_path,),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    return int(row[0])
+            except Exception as exc:
+                logger.warning("Não foi possível resolver media_id pelo caminho: %s", exc)
+
+        return candidate
+
+    def _require_database_media_id(self, media: object, action: str = "usar as cenas") -> int:
+        media_id = self._database_media_id(media)
+        if media_id is None:
+            raise RuntimeError(
+                f"Não foi possível localizar este episódio no banco para {action}. "
+                "Clique em Atualizar na aba de cenas ou reimporte o episódio."
+            )
+        return int(media_id)
+
     def _on_media_changed(self, index: int) -> None:
         self._stop_preview()
         self._load_scenes_for_selected_media()
@@ -1081,7 +1280,8 @@ class SceneDetectionView(QWidget):
             QMessageBox.critical(self, "Arquivo não encontrado", f"O arquivo original não foi encontrado:\n{file_path}")
             return
 
-        existing_count = self.repository.get_scene_count(media.id)
+        media_db_id = self._require_database_media_id(media, "detectar cenas")
+        existing_count = self.repository.get_scene_count(media_db_id)
         if existing_count > 0:
             reply = QMessageBox.question(
                 self,
@@ -1112,12 +1312,13 @@ class SceneDetectionView(QWidget):
         try:
             if not media:
                 return
-            saved = self.repository.save_detected_scenes(media.id, scenes, self.threshold_spin.value())
+            media_db_id = self._require_database_media_id(media, "salvar cenas detectadas")
+            saved = self.repository.save_detected_scenes(media_db_id, scenes, self.threshold_spin.value())
             self.status_label.setText(
                 f"Detecção rápida concluída: {saved} cena(s) salva(s). "
                 f"Configuração: {self.detection_preset_combo.currentText()} | "
                 f"limiar {self.threshold_spin.value():.2f} | mínimo {self.min_scene_spin.value():.1f}s. "
-                "Agora use 'Catalogar básico' para miniatura local ou 'IA nas selecionadas' para descrição inteligente."
+                "Agora clique em 'Criar índice inteligente' para transformar as cenas em uma biblioteca pesquisável."
             )
             self._load_scenes_for_selected_media(select_first=True)
             if saved >= 80:
@@ -1125,7 +1326,7 @@ class SceneDetectionView(QWidget):
                     self,
                     "Muitas cenas detectadas",
                     f"Foram detectadas {saved} cenas. Isso é normal em anime.\n\n"
-                    "Recomendação: selecione apenas as cenas que interessam e clique em 'IA nas selecionadas' ou 'Catalogar básico'. "
+                    "Recomendação: use 'Criar índice inteligente' para indexar as cenas com IA, ou selecione poucas cenas e use 'IA selecionadas'. "
                     "Use 'Menos cortes' se quiser uma lista mais curta.",
                 )
         finally:
@@ -1174,7 +1375,7 @@ class SceneDetectionView(QWidget):
         worker = _SceneCatalogWorker(
             detector=self.scene_detector,
             file_path=file_path,
-            media_id=media.id,
+            media_id=self._require_database_media_id(media, "catalogar cenas"),
             scenes=scenes,
             frames_per_scene=1,
         )
@@ -1198,7 +1399,7 @@ class SceneDetectionView(QWidget):
                     ai_status=scene.get("ai_status") or "auto_local",
                 ):
                     updated += 1
-            self.status_label.setText(f"Catalogação básica concluída: {updated} cena(s) atualizada(s). Use IA nas selecionadas para descrição inteligente.")
+            self.status_label.setText(f"Catalogação básica concluída: {updated} cena(s) atualizada(s). Use Criar índice inteligente para busca por objetivo.")
             self._load_scenes_for_selected_media(select_scene_id=current_scene_id, select_first=False)
         finally:
             self._set_busy(False)
@@ -1214,6 +1415,11 @@ class SceneDetectionView(QWidget):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self.status_label.setText)
+        if hasattr(worker, "partial"):
+            try:
+                worker.partial.connect(self._on_ai_worker_partial)
+            except Exception:
+                pass
         worker.finished.connect(finished_handler)
         worker.failed.connect(self._on_worker_failed)
         worker.finished.connect(thread.quit)
@@ -1231,9 +1437,14 @@ class SceneDetectionView(QWidget):
 
     def _on_worker_failed(self, message: str) -> None:
         logger.error("Operação de cenas falhou: %s", message)
-        self.status_label.setText(f"Operação interrompida: {message}")
-        if "cancelada" not in str(message).lower():
-            QMessageBox.critical(self, "Erro", str(message))
+        friendly = _friendly_gemini_error(message)
+        self.status_label.setText(f"Operação interrompida: {friendly}")
+        lower = str(message).lower()
+        if "cancelada" not in lower:
+            if "429" in lower or "resource_exhausted" in lower or "quota" in lower or "rate limit" in lower:
+                QMessageBox.warning(self, "Limite da Gemini atingido", friendly)
+            else:
+                QMessageBox.critical(self, "Erro", friendly)
         self._set_busy(False)
 
     def _clear_active_worker(self) -> None:
@@ -1251,6 +1462,8 @@ class SceneDetectionView(QWidget):
             self.generate_ai_selected_btn.setEnabled(not busy)
         if hasattr(self, "ai_selected_top_btn"):
             self.ai_selected_top_btn.setEnabled(not busy)
+        if hasattr(self, "classify_episode_btn"):
+            self.classify_episode_btn.setEnabled(not busy and self._selected_media_obj() is not None)
         if hasattr(self, "test_ollama_btn"):
             self.test_ollama_btn.setEnabled(not busy)
         self.clear_btn.setEnabled(not busy)
@@ -1265,6 +1478,8 @@ class SceneDetectionView(QWidget):
             self.generate_ai_selected_btn.setEnabled(not busy)
         if hasattr(self, "ai_selected_top_btn"):
             self.ai_selected_top_btn.setEnabled(not busy)
+        if hasattr(self, "classify_episode_btn"):
+            self.classify_episode_btn.setEnabled(not busy and self._selected_media_obj() is not None)
         if hasattr(self, "test_ollama_btn"):
             self.test_ollama_btn.setEnabled(not busy)
         if hasattr(self, "gemini_model_edit"):
@@ -1291,6 +1506,8 @@ class SceneDetectionView(QWidget):
             self.generate_ai_selected_btn.setEnabled(not busy)
         if hasattr(self, "ai_selected_top_btn"):
             self.ai_selected_top_btn.setEnabled(not busy)
+        if hasattr(self, "classify_episode_btn"):
+            self.classify_episode_btn.setEnabled(has_media and not busy)
         if hasattr(self, "test_ollama_btn"):
             self.test_ollama_btn.setEnabled(not busy)
 
@@ -1299,7 +1516,8 @@ class SceneDetectionView(QWidget):
         if not media:
             return
 
-        count = self.repository.get_scene_count(media.id)
+        media_db_id = self._require_database_media_id(media, "limpar cenas")
+        count = self.repository.get_scene_count(media_db_id)
         if count <= 0:
             QMessageBox.information(self, "Limpar cenas", "Este episódio não tem cenas salvas.")
             return
@@ -1314,7 +1532,7 @@ class SceneDetectionView(QWidget):
         if reply != QMessageBox.Yes:
             return
 
-        removed = self.repository.clear_scenes_for_media(media.id)
+        removed = self.repository.clear_scenes_for_media(media_db_id)
         self._selected_scene = None
         self._clear_detail_panel()
         self.status_label.setText(f"{removed} cena(s) removida(s).")
@@ -1333,7 +1551,8 @@ class SceneDetectionView(QWidget):
             return
 
         try:
-            scenes = self.repository.get_scenes_by_media(media.id)
+            media_db_id = self._require_database_media_id(media, "carregar cenas")
+            scenes = self.repository.get_scenes_by_media(media_db_id)
         except Exception as exc:
             logger.error("Erro ao carregar cenas: %s", exc, exc_info=True)
             QMessageBox.critical(self, "Erro", f"Erro ao carregar cenas: {exc}")
@@ -1370,13 +1589,227 @@ class SceneDetectionView(QWidget):
             self.table.setItem(row, 5, QTableWidgetItem(str(scene.get("scene_type") or "Geral")))
             self.table.setItem(row, 6, QTableWidgetItem(str(scene.get("tags") or "")))
             self.table.setItem(row, 7, QTableWidgetItem(str(scene.get("description") or "")))
-            self.table.setItem(row, 8, QTableWidgetItem("★" if int(scene.get("is_favorite") or 0) else ""))
+            self.table.setItem(row, 8, QTableWidgetItem(""))
+            self.table.setItem(row, 9, QTableWidgetItem("★" if int(scene.get("is_favorite") or 0) else ""))
 
         self.status_label.setText(f"{len(scenes)} cena(s) carregada(s) para {media.file_info.file_name}.")
+        self._apply_scene_search_filter(silent=True)
         if select_scene_id is not None:
             self._select_scene_by_id(select_scene_id)
         elif select_first:
-            self.table.selectRow(0)
+            self._select_first_visible_scene()
+
+    def _select_first_visible_scene(self) -> None:
+        for row in range(self.table.rowCount()):
+            if not self.table.isRowHidden(row):
+                self.table.selectRow(row)
+                return
+
+    def _on_scene_search_preset_changed(self, text: str) -> None:
+        value = str(text or "").strip()
+        if not value or value.startswith("Escolher"):
+            return
+        if hasattr(self, "scene_search_edit"):
+            self.scene_search_edit.setText(value)
+        self._apply_scene_search_filter()
+
+    def _clear_scene_search_filter(self) -> None:
+        if hasattr(self, "scene_search_edit"):
+            self.scene_search_edit.clear()
+        self._apply_scene_search_filter()
+
+    def _select_search_results(self) -> None:
+        visible_rows = [row for row in range(self.table.rowCount()) if not self.table.isRowHidden(row)]
+        if not visible_rows:
+            QMessageBox.information(self, "Busca de cenas", "Nenhum resultado visível para selecionar.")
+            return
+        self.table.clearSelection()
+        selection_model = self.table.selectionModel()
+        if selection_model is None:
+            return
+        for row in visible_rows:
+            index = self.table.model().index(row, 0)
+            selection_model.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        self.status_label.setText(f"{len(visible_rows)} resultado(s) selecionado(s).")
+
+    def _join_search_results(self) -> None:
+        self._select_search_results()
+        selected_rows = self._selected_rows()
+        if len(selected_rows) < 2:
+            QMessageBox.information(self, "Juntar resultados", "A busca precisa ter pelo menos duas cenas visíveis para criar um clipe rascunho.")
+            return
+        self._play_selected_scenes_joined()
+
+    def _apply_scene_search_filter(self, silent: bool = False) -> None:
+        query = self.scene_search_edit.text().strip() if hasattr(self, "scene_search_edit") else ""
+        if not query:
+            for row in range(self.table.rowCount()):
+                self.table.setRowHidden(row, False)
+                if self.table.item(row, 8):
+                    self.table.item(row, 8).setText("")
+                    self.table.item(row, 8).setToolTip("")
+            if not silent and self._scenes_by_row:
+                self.status_label.setText(f"Busca limpa. {len(self._scenes_by_row)} cena(s) visíveis.")
+            return
+
+        scored_rows: list[tuple[int, int, str]] = []
+        visible = 0
+        for row, scene in self._scenes_by_row.items():
+            score, reason = self._scene_match_details(scene, query)
+            matched = score > 0
+            self.table.setRowHidden(row, not matched)
+            item = self.table.item(row, 8)
+            if item is None:
+                item = QTableWidgetItem("")
+                self.table.setItem(row, 8, item)
+            if matched:
+                visible += 1
+                item.setText(f"{score}%")
+                item.setToolTip(reason)
+                scored_rows.append((score, row, reason))
+            else:
+                item.setText("")
+                item.setToolTip("")
+
+        if not silent:
+            if visible:
+                best_score, best_row, best_reason = max(scored_rows, key=lambda item: item[0])
+                scene = self._scenes_by_row.get(best_row, {})
+                name = scene.get("display_name") or f"Cena {int(scene.get('scene_number') or 0):03d}"
+                self.status_label.setText(
+                    f"Busca ‘{query}’: {visible} resultado(s). Melhor: {name} ({best_score}%). {best_reason}"
+                )
+            else:
+                self.status_label.setText(
+                    f"Busca ‘{query}’: nenhum resultado. Crie o índice inteligente do episódio ou tente termos parecidos."
+                )
+        if visible and not self.table.selectionModel().selectedRows():
+            self._select_first_visible_scene()
+
+    def _scene_match_details(self, scene: Dict[str, Any], query: str) -> tuple[int, str]:
+        normalized_query = self._normalize_scene_search_text(query)
+        terms = self._expanded_scene_search_terms(query)
+        if not normalized_query or not terms:
+            return 0, ""
+
+        fields = self._scene_search_fields(scene)
+        blob = " ".join(fields.values())
+
+        matched_terms: list[str] = []
+        field_hits: dict[str, list[str]] = {"tipo": [], "tags": [], "descrição": [], "ia": [], "nome": []}
+        for term in terms:
+            if not term:
+                continue
+            found_any = False
+            for label, field_text in fields.items():
+                if term in field_text:
+                    found_any = True
+                    if term not in field_hits[label]:
+                        field_hits[label].append(term)
+            if found_any and term not in matched_terms:
+                matched_terms.append(term)
+
+        if not matched_terms and normalized_query not in blob:
+            return 0, ""
+
+        score = 18
+        if normalized_query in blob:
+            score += 30
+        score += min(len(matched_terms) * 9, 36)
+        score += min(len(field_hits.get("tags", [])) * 8, 20)
+        score += min(len(field_hits.get("tipo", [])) * 10, 20)
+        score += min(len(field_hits.get("ia", [])) * 6, 18)
+        if "alto potencial" in normalized_query or "tiktok" in normalized_query or "apresentar" in normalized_query:
+            if any(word in blob for word in ["potencial", "alto", "muito alto", "tiktok", "sugestao", "apresentar", "introducao"]):
+                score += 18
+        if int(scene.get("is_favorite") or 0):
+            score += 4
+        score = max(1, min(score, 100))
+
+        reason_parts = []
+        for label in ["tipo", "tags", "descrição", "ia", "nome"]:
+            hits = field_hits.get(label) or []
+            if hits:
+                reason_parts.append(f"{label}: {', '.join(hits[:5])}")
+        if not reason_parts:
+            reason_parts.append("termos encontrados no índice da cena")
+        return score, "Motivo: " + " | ".join(reason_parts[:4])
+
+    def _scene_search_fields(self, scene: Dict[str, Any]) -> Dict[str, str]:
+        fields = {
+            "nome": self._normalize_scene_search_text(scene.get("display_name") or f"Cena {int(scene.get('scene_number') or 0):03d}"),
+            "tipo": self._normalize_scene_search_text(scene.get("scene_type")),
+            "tags": self._normalize_scene_search_text(scene.get("tags")),
+            "descrição": self._normalize_scene_search_text(scene.get("description")),
+            "ia": self._normalize_scene_search_text(scene.get("analysis_frames_json")),
+        }
+        extra = []
+        if int(scene.get("is_favorite") or 0):
+            extra.append("favorita favorito estrela alto potencial selecionada")
+        if int(scene.get("is_merged") or 0):
+            extra.append("clipe juntado compilado montagem")
+        if extra:
+            fields["ia"] = (fields.get("ia", "") + " " + " ".join(extra)).strip()
+        return fields
+
+    def _scene_search_blob(self, scene: Dict[str, Any]) -> str:
+        return " ".join(self._scene_search_fields(scene).values())
+
+    def _expanded_scene_search_terms(self, query: str) -> list[str]:
+        normalized = self._normalize_scene_search_text(query)
+        stopwords = {
+            "a", "o", "as", "os", "um", "uma", "uns", "umas", "de", "da", "do", "das", "dos", "em", "no", "na", "nos", "nas",
+            "para", "por", "com", "sem", "que", "quero", "queria", "achar", "buscar", "procura", "procurar", "mostrar",
+            "cena", "cenas", "parte", "trecho", "video", "vídeo", "clipe", "clipes", "anime", "episodio", "episódio",
+        }
+        raw_terms = [term for term in normalized.replace(",", " ").split() if len(term) >= 3 and term not in stopwords]
+        expansions = {
+            "explosao": ["explosao", "explosion", "fogo", "fire", "chama", "chamas", "impacto", "destruicao", "fumaca", "clarão", "clarao", "luz intensa", "estouro"],
+            "explosoes": ["explosao", "explosion", "fogo", "impacto", "destruicao", "fumaca", "clarao"],
+            "fogo": ["fogo", "chama", "chamas", "incendio", "queimando", "explosao", "clarão", "clarao"],
+            "luta": ["luta", "fight", "batalha", "combate", "acao", "confronto", "ataque", "golpe", "impacto", "duelo"],
+            "batalha": ["batalha", "luta", "combate", "confronto", "ataque", "duelo"],
+            "acao": ["acao", "ação", "luta", "batalha", "movimento", "perseguicao", "ataque", "impacto"],
+            "magia": ["magia", "magico", "mágico", "poder", "habilidade", "feitico", "feitiço", "mana", "aura", "energia"],
+            "poder": ["poder", "habilidade", "aura", "energia", "magia", "transformacao", "ataque"],
+            "transformacao": ["transformacao", "transformação", "evolucao", "evolução", "mudanca", "mudança", "poder", "forma"],
+            "triste": ["triste", "tristeza", "drama", "emocional", "choro", "chorando", "melancolico", "melancólico"],
+            "emocional": ["emocional", "drama", "triste", "choro", "tensao", "revelacao"],
+            "engracada": ["engracada", "engraçada", "engracado", "engraçado", "comedia", "comédia", "humor", "piada", "reacao"],
+            "engracado": ["engracada", "engraçada", "engracado", "engraçado", "comedia", "humor", "piada", "reacao"],
+            "dialogo": ["dialogo", "diálogo", "conversa", "fala", "explicacao", "explicação", "revelacao", "revelação"],
+            "fala": ["fala", "dialogo", "conversa", "frase", "personagem", "revelacao"],
+            "romance": ["romance", "amor", "casal", "fofo", "fofa", "emocional"],
+            "epica": ["epica", "épica", "epico", "épico", "impactante", "poder", "aura", "batalha", "alto potencial"],
+            "epico": ["epica", "epico", "impactante", "poder", "aura", "batalha", "alto potencial"],
+            "paisagem": ["paisagem", "cenario", "cenário", "floresta", "montanha", "cidade", "ceu", "céu", "ambiente", "panorama", "bonita", "bonito"],
+            "bonita": ["bonita", "bonito", "paisagem", "cenario", "visual", "lindo", "iluminacao", "iluminação"],
+            "assustado": ["assustado", "medo", "surpreso", "susto", "tensao", "tensão", "perigo", "reacao", "reação"],
+            "apresentar": ["apresentar", "introducao", "introdução", "premissa", "mundo", "protagonista", "alto potencial", "sugestao"],
+            "tiktok": ["tiktok", "alto potencial", "muito alto", "gancho", "impactante", "sugestao", "vídeo curto", "video curto"],
+        }
+        terms: list[str] = []
+        for term in raw_terms:
+            terms.append(term)
+            terms.extend(self._normalize_scene_search_text(item) for item in expansions.get(term, []))
+        important_phrase = " ".join(term for term in raw_terms if term not in stopwords)
+        if len(important_phrase) >= 3:
+            terms.append(important_phrase)
+        seen = set()
+        result = []
+        for term in terms:
+            term = term.strip()
+            if term and term not in seen:
+                seen.add(term)
+                result.append(term)
+        return result
+
+    @staticmethod
+    def _normalize_scene_search_text(text: object) -> str:
+        value = str(text or "").lower()
+        value = unicodedata.normalize("NFD", value)
+        value = "".join(ch for ch in value if unicodedata.category(ch) != "Mn")
+        return value
 
     def _on_scene_selected(self) -> None:
         selected_rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
@@ -1506,10 +1939,81 @@ class SceneDetectionView(QWidget):
                 return
         self._start_ai_worker(scenes)
 
-    def _start_ai_worker(self, scenes: list[Dict[str, Any]]) -> None:
+
+    def _on_classify_episode_clicked(self) -> None:
+        """Classificar/indexar o episódio inteiro para busca local posterior."""
         media = self._selected_media_obj()
         if not media:
-            QMessageBox.information(self, "Descrição IA", "Selecione um episódio válido.")
+            QMessageBox.information(self, "Criar índice inteligente", "Selecione um episódio válido.")
+            return
+
+        scenes_all = list(self._scenes_by_row.values())
+        if not scenes_all:
+            QMessageBox.information(
+                self,
+                "Criar índice inteligente",
+                "Detecte as cenas deste episódio antes de criar o índice com IA.",
+            )
+            return
+
+        # Indexação do episódio deve priorizar cenas normais; clipes rascunho juntados podem ser analisados depois na Biblioteca.
+        normal_scenes = [scene for scene in scenes_all if not int(scene.get("is_merged") or 0)]
+        if not normal_scenes:
+            normal_scenes = scenes_all
+
+        pending = [scene for scene in normal_scenes if not self._scene_has_gemini_classification(scene)]
+        if not pending:
+            reply = QMessageBox.question(
+                self,
+                "Episódio já classificado",
+                f"As {len(normal_scenes)} cena(s) deste episódio já parecem ter classificação IA salva.\n\n"
+                "Deseja reclassificar todas mesmo assim? Isso usará novamente a cota da Gemini API.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            pending = normal_scenes
+
+        count = len(pending)
+        reply = QMessageBox.question(
+            self,
+            "Criar índice inteligente?",
+            f"O app vai analisar {count} cena(s) deste episódio com Gemini e criar um índice pesquisável.\n\n"
+            "Isso usa a API uma vez por cena e pode consumir a cota gratuita.\n"
+            "O índice usa frames do início/meio/fim da cena, salva descrição, tags, ações, emoção e potencial.\n\n"
+            "Depois disso, a busca por explosão, luta, magia, drama etc. ficará local e instantânea.\n\n"
+            "Deseja continuar?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No if count > 10 else QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._start_ai_worker(
+            pending,
+            max_frames=3,
+            operation_label="Índice inteligente do episódio",
+            status_prefix="Criando índice inteligente",
+        )
+
+    def _scene_has_gemini_classification(self, scene: Dict[str, Any]) -> bool:
+        ai_status = str(scene.get("ai_status") or "").lower()
+        if "gemini" in ai_status:
+            return True
+        analysis = str(scene.get("analysis_frames_json") or "").lower()
+        return "gemini" in analysis or "gemini_api" in analysis
+
+    def _start_ai_worker(
+        self,
+        scenes: list[Dict[str, Any]],
+        max_frames: int = 1,
+        operation_label: str = "Descrição IA",
+        status_prefix: str = "Preparando descrição online segura",
+    ) -> None:
+        media = self._selected_media_obj()
+        if not media:
+            QMessageBox.information(self, operation_label, "Selecione um episódio válido.")
             return
         file_path = media.file_info.file_path
         if not Path(file_path).exists():
@@ -1521,8 +2025,8 @@ class SceneDetectionView(QWidget):
             QMessageBox.warning(
                 self,
                 "API Key necessária",
-                "Cole sua API Key gratuita do Gemini antes de gerar a descrição online.\n\n"
-                "A chave não é salva pelo app nesta sprint. Você também pode definir a variável de ambiente GEMINI_API_KEY."
+                "Cole sua API Key gratuita do Gemini antes de usar a classificação/descrição online.\n\n"
+                "Marque 'Salvar chave neste PC' para não precisar colar novamente."
             )
             return
 
@@ -1537,20 +2041,40 @@ class SceneDetectionView(QWidget):
             "anime": self.folder_combo.currentText(),
             "season": self.season_combo.currentText(),
             "episode": media.file_info.file_name,
+            "classification_goal": "Gerar uma descrição pesquisável para encontrar cenas por intenção, como explosão, luta, magia, emoção, paisagem, diálogo, transformação, poder, comédia ou drama.",
         }
-        self._set_busy(True, f"Preparando descrição online segura para {len(scenes)} cena(s). Enviando 1 frame comprimido por cena...")
+        frame_word = "frame" if int(max_frames or 1) == 1 else "frames"
+        self._set_busy(True, f"{status_prefix}: {len(scenes)} cena(s). Enviando até {int(max_frames or 1)} {frame_word} comprimido(s) por cena...")
         worker = _SceneAIWorker(
             detector=self.scene_detector,
             ai_service=self.ai_service,
             file_path=file_path,
-            media_id=media.id,
+            media_id=self._require_database_media_id(media, "analisar cenas com IA"),
             media_context=media_context,
             scenes=scenes,
             api_key=api_key,
             model=model,
-            max_frames=1,
+            max_frames=max_frames,
         )
         self._start_worker(worker, self._on_ai_worker_finished, operation="ai_description")
+
+    def _on_ai_worker_partial(self, result: Dict[str, Any]) -> None:
+        """Salvar cada cena assim que a IA responder, evitando perder progresso se a cota acabar no meio."""
+        try:
+            scene_id = result.get("id")
+            if not scene_id:
+                return
+            self.repository.update_scene_visual_catalog(
+                scene_id=scene_id,
+                description=result.get("description"),
+                tags=result.get("tags"),
+                scene_type=result.get("scene_type"),
+                thumbnail_path=None,
+                analysis_frames_json=result.get("analysis_frames_json"),
+                ai_status=result.get("ai_status") or "gemini_api",
+            )
+        except Exception as exc:
+            logger.warning("Não foi possível salvar resultado parcial da IA: %s", exc)
 
     def _on_ai_worker_finished(self, results: list[Dict[str, Any]]) -> None:
         updated = 0
@@ -1570,7 +2094,7 @@ class SceneDetectionView(QWidget):
                     ai_status=result.get("ai_status") or "gemini_api",
                 ):
                     updated += 1
-            self.status_label.setText(f"Descrição IA concluída: {updated} cena(s) atualizada(s).")
+            self.status_label.setText(f"Índice inteligente concluído: {updated} cena(s) atualizada(s). Agora pesquise por objetivo, como explosão, luta, magia, paisagem ou emoção.")
             self._load_scenes_for_selected_media(select_scene_id=current_scene_id, select_first=False)
         finally:
             self._set_busy(False)
@@ -1641,11 +2165,13 @@ class SceneDetectionView(QWidget):
             self.status_label.setText(f"Gemini OK. Modelo selecionado: {result.get('model') or model}")
             self._maybe_save_gemini_settings(api_key, result.get('model') or model)
         except GeminiSceneAIError as exc:
-            QMessageBox.warning(self, "Gemini não disponível", str(exc))
-            self.status_label.setText(f"Gemini não disponível: {exc}")
+            friendly = _friendly_gemini_error(exc)
+            QMessageBox.warning(self, "Gemini não disponível", friendly)
+            self.status_label.setText(f"Gemini não disponível: {friendly}")
         except Exception as exc:
-            QMessageBox.warning(self, "Gemini não disponível", f"Não foi possível conectar à Gemini API: {exc}")
-            self.status_label.setText(f"Gemini não disponível: {exc}")
+            friendly = _friendly_gemini_error(exc)
+            QMessageBox.warning(self, "Gemini não disponível", friendly)
+            self.status_label.setText(f"Gemini não disponível: {friendly}")
 
     def _toggle_play_pause(self) -> None:
         """Alternar entre reproduzir e pausar sem reiniciar o trecho.
@@ -1739,7 +2265,8 @@ class SceneDetectionView(QWidget):
             return
 
         try:
-            merged_scene = self.repository.create_merged_scene(media.id, scenes, display_name=clip_name)
+            media_db_id = self._require_database_media_id(media, "criar clipe rascunho")
+            merged_scene = self.repository.create_merged_scene(media_db_id, scenes, display_name=clip_name)
             self.status_label.setText(
                 f"Clipe rascunho criado: {merged_scene.get('display_name') or clip_name} "
                 f"com duração {self._format_time(self._clip_duration_seconds(merged_scene))}."
@@ -2105,7 +2632,7 @@ class SceneDetectionView(QWidget):
 
         try:
             new_scene = self.repository.create_cut_scene(
-                media_id=self._selected_media.id,
+                media_id=self._require_database_media_id(self._selected_media, "criar marcação de corte"),
                 source_scene=self._selected_scene,
                 start_seconds=start,
                 end_seconds=end,
@@ -2249,7 +2776,7 @@ class SceneDetectionView(QWidget):
         scene_type = str(first_scene.get("scene_type") or "Geral")
         metadata = {
             "clip_name": clip_name,
-            "source_media_id": str(media.id),
+            "source_media_id": str(self._require_database_media_id(media, "exportar clipe")),
             "source_file": str(source_path),
             "library_folder": folder,
             "library_season": clips_season,
@@ -2274,7 +2801,7 @@ class SceneDetectionView(QWidget):
                 metadata=metadata,
             )
             record_id = self.repository.save_exported_clip(
-                media_id=media.id,
+                media_id=self._require_database_media_id(media, "registrar clipe exportado"),
                 scene_id=first_scene.get("id") if len(scenes) == 1 else None,
                 clip_name=clip_name,
                 output_path=result["output_path"],

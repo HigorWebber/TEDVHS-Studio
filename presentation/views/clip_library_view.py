@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QCheckBox,
     QComboBox,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -31,6 +33,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -54,10 +57,53 @@ from infrastructure.ai.gemini_narration_service import (
     GeminiNarrationError,
     GeminiNarrationService,
 )
+from infrastructure.tts.narration_audio_service import (
+    DEFAULT_TTS_RATE,
+    DEFAULT_TTS_VOICE,
+    NarrationAudioError,
+    NarrationAudioService,
+)
 from infrastructure.settings.api_settings import ApiSettingsStore
 
 
 logger = logging.getLogger(__name__)
+
+
+def _friendly_gemini_error(message: object) -> str:
+    """Transformar erros longos da Gemini em mensagem curta e útil para a interface."""
+    raw = str(message or "").strip()
+    lower = raw.lower()
+
+    retry_hint = ""
+    retry_match = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", raw, flags=re.IGNORECASE)
+    if retry_match:
+        try:
+            seconds = float(retry_match.group(1))
+            if seconds >= 3600:
+                retry_hint = f"\n\nTente novamente em aproximadamente {seconds / 3600:.1f} hora(s)."
+            elif seconds >= 60:
+                retry_hint = f"\n\nTente novamente em aproximadamente {seconds / 60:.0f} minuto(s)."
+            else:
+                retry_hint = f"\n\nTente novamente em aproximadamente {seconds:.0f} segundo(s)."
+        except Exception:
+            retry_hint = ""
+
+    if "429" in lower or "resource_exhausted" in lower or "quota" in lower or "rate limit" in lower:
+        return (
+            "Limite gratuito da Gemini API atingido ou muitas chamadas em pouco tempo.\n\n"
+            "O processo foi interrompido com segurança para não continuar gastando cota.\n"
+            "Aguarde a cota liberar ou use o que já foi gerado/salvo no clipe."
+            f"{retry_hint}"
+        )
+    if "api key" in lower or "permission_denied" in lower or "unauthenticated" in lower:
+        return "A API Key da Gemini não foi aceita. Confira se a chave está correta e salva no app."
+    if "not_found" in lower or "model" in lower and "available" in lower:
+        return "Modelo Gemini indisponível para esta chave. Use gemini-3.1-flash-lite ou outro modelo disponível na sua conta."
+    if "timeout" in lower or "timed out" in lower:
+        return "A Gemini demorou demais para responder. Tente novamente com um único clipe."
+    if len(raw) > 600:
+        return raw[:600] + "..."
+    return raw or "Erro desconhecido na operação."
 
 
 class _ClipAIWorker(QObject):
@@ -330,6 +376,7 @@ class _ClipNarrationWorker(QObject):
                 "model": self.model,
                 "style": self.style,
                 "length": self.length,
+                "target_seconds": context.get("duration_seconds"),
                 "result": result,
             })
         except Exception as exc:
@@ -345,6 +392,7 @@ class _ClipNarrationWorker(QObject):
             "episode": clip.get("source_episode_name") or clip.get("episode_name") or metadata.get("source_episode_name") or "Episódio não informado",
             "clip_name": clip.get("clip_name") or metadata.get("clip_name") or "Clipe exportado",
             "duration": self._format_time(float(clip.get("duration_seconds") or metadata.get("duration_seconds") or 0.0)),
+            "duration_seconds": float(clip.get("duration_seconds") or metadata.get("duration_seconds") or 0.0),
             "scene_type": clip.get("scene_type") or metadata.get("scene_type") or "Geral",
             "tags": clip.get("tags") or metadata.get("tags") or "",
             "description": clip.get("description") or metadata.get("description") or "",
@@ -419,7 +467,77 @@ class _ClipNarrationWorker(QObject):
         return f"{minutes:02d}:{secs:02d}"
 
 
+
+
+class _ClipNarrationAudioWorker(QObject):
+    """Worker em QThread para gerar áudio de narração e exportar vídeo narrado."""
+
+    progress = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        audio_service: NarrationAudioService,
+        clip: Dict[str, Any],
+        script: str,
+        voice: str,
+        rate: str,
+        action: str = "generate_audio",
+        background_volume: float = 0.25,
+    ):
+        super().__init__()
+        self.audio_service = audio_service
+        self.clip = dict(clip or {})
+        self.script = str(script or "")
+        self.voice = str(voice or DEFAULT_TTS_VOICE).strip() or DEFAULT_TTS_VOICE
+        self.rate = str(rate or DEFAULT_TTS_RATE).strip() or DEFAULT_TTS_RATE
+        self.action = str(action or "generate_audio")
+        self.background_volume = float(background_volume or 0.25)
+
+    def run(self) -> None:
+        try:
+            clip_name = str(self.clip.get("clip_name") or "Clipe")
+            if self.action == "export_video":
+                self.progress.emit(f"Exportando vídeo com narração: {clip_name}...")
+                result = self.audio_service.export_video_with_narration(
+                    self.clip,
+                    audio_path=self._audio_path_from_clip(),
+                    background_volume=self.background_volume,
+                )
+                result.update({"id": self.clip.get("id"), "action": "export_video"})
+                self.finished.emit(result)
+                return
+
+            self.progress.emit(f"Gerando áudio de narração: {clip_name}...")
+            result = self.audio_service.generate_audio(
+                self.clip,
+                script=self.script,
+                voice=self.voice,
+                rate=self.rate,
+            )
+            result.update({"id": self.clip.get("id"), "action": "generate_audio"})
+            self.finished.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _audio_path_from_clip(self) -> str:
+        metadata = self.clip.get("metadata_json") if isinstance(self.clip.get("metadata_json"), dict) else {}
+        for value in (
+            self.clip.get("narration_audio_path"),
+            self.clip.get("audio_narration_path"),
+            metadata.get("narration_audio_path") if isinstance(metadata, dict) else None,
+            metadata.get("audio_narration_path") if isinstance(metadata, dict) else None,
+        ):
+            if value:
+                return str(value)
+        output_path = Path(str(self.clip.get("output_path") or ""))
+        if output_path.name:
+            return str(output_path.with_name(f"{output_path.stem} narração.mp3"))
+        return ""
+
 class ClipLibraryView(QWidget):
+    send_to_montage_requested = Signal(object)
     """Aba para visualizar, pré-visualizar e organizar clipes exportados."""
 
     def __init__(self, repository: Any, parent: Optional[QWidget] = None) -> None:
@@ -432,6 +550,7 @@ class ClipLibraryView(QWidget):
         self.ai_service = GeminiSceneAIService(timeout_seconds=120)
         self.subtitle_service = HybridSubtitleService(timeout_seconds=180)
         self.narration_service = GeminiNarrationService(timeout_seconds=120)
+        self.narration_audio_service = NarrationAudioService(timeout_seconds=180)
         self.api_settings = ApiSettingsStore()
         self._ai_thread: Optional[QThread] = None
         self._ai_worker: Optional[_ClipAIWorker] = None
@@ -439,8 +558,48 @@ class ClipLibraryView(QWidget):
         self._subtitle_worker: Optional[_ClipSubtitleWorker] = None
         self._narration_thread: Optional[QThread] = None
         self._narration_worker: Optional[_ClipNarrationWorker] = None
+        self._narration_audio_thread: Optional[QThread] = None
+        self._narration_audio_worker: Optional[_ClipNarrationAudioWorker] = None
         self._setup_ui()
         self.refresh_clips()
+
+    def _configure_multiline_text_box(self, edit: QTextEdit, min_height: int = 130) -> None:
+        """Padronizar campos longos para não estourarem o layout.
+
+        Campos de IA, roteiro e postagem podem ficar enormes. Eles devem rolar
+        por dentro, não aumentar a altura mínima da aba inteira e empurrar a
+        parte inferior da janela para fora da tela.
+        """
+        edit.setAcceptRichText(False)
+        edit.setMinimumHeight(min_height)
+        edit.setMaximumHeight(max(220, min_height + 110))
+        edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        edit.setLineWrapMode(QTextEdit.WidgetWidth)
+        edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        edit.setStyleSheet(
+            "QTextEdit { padding: 8px; border: 1px solid #3c3c3c; background: #1f1f1f; }"
+            "QTextEdit:focus { border: 1px solid #5a7ec8; }"
+        )
+
+    def _path_key(self, value: Any) -> str:
+        """Normalizar caminhos para comparar mídia sem resetar o player no Windows."""
+        try:
+            raw = str(value or "").replace("\\\\", "/")
+            if raw.startswith("file:///"):
+                raw = QUrl(raw).toLocalFile()
+            return os.path.normcase(os.path.abspath(raw))
+        except Exception:
+            return str(value or "").replace("\\\\", "/").lower()
+
+    def _player_source_matches(self, player: QMediaPlayer, path: Path) -> bool:
+        try:
+            source = player.source()
+            if source.isEmpty():
+                return False
+            return self._path_key(source.toLocalFile()) == self._path_key(path)
+        except Exception:
+            return False
 
     def _setup_ui(self) -> None:
         main_layout = QVBoxLayout(self)
@@ -481,6 +640,9 @@ class ClipLibraryView(QWidget):
         main_layout.addWidget(self.status_label)
 
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setMinimumHeight(0)
+        splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_layout.addWidget(splitter, 1)
 
         left_widget = QWidget()
@@ -504,7 +666,9 @@ class ClipLibraryView(QWidget):
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustIgnored)
-        self.table.setMinimumWidth(520)
+        self.table.setMinimumWidth(500)
+        self.table.setMinimumHeight(0)
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.table.setColumnWidth(0, 210)
         self.table.setColumnWidth(1, 120)
         self.table.setColumnWidth(2, 130)
@@ -521,20 +685,29 @@ class ClipLibraryView(QWidget):
 
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_scroll.setSizeAdjustPolicy(QAbstractScrollArea.AdjustIgnored)
+        right_scroll.setMinimumHeight(0)
+        right_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         right_widget = QWidget()
-        right_widget.setMinimumWidth(540)
+        right_widget.setMinimumWidth(560)
+        right_widget.setMinimumHeight(0)
+        right_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(8, 0, 8, 0)
+        right_layout.setSpacing(10)
 
         preview_group = QGroupBox("Preview do clipe")
+        preview_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         preview_layout = QVBoxLayout(preview_group)
 
         self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumHeight(260)
-        self.video_widget.setMaximumHeight(420)
+        self.video_widget.setMinimumHeight(190)
+        self.video_widget.setMaximumHeight(330)
+        self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_widget.setStyleSheet("background: black;")
         preview_layout.addWidget(self.video_widget, 1)
 
@@ -564,23 +737,27 @@ class ClipLibraryView(QWidget):
         self.open_folder_btn = QPushButton("Abrir pasta")
         self.open_folder_btn.clicked.connect(self._open_selected_folder)
         controls_layout.addWidget(self.open_folder_btn)
+        self.send_to_montage_btn = QPushButton("Enviar para montagem")
+        self.send_to_montage_btn.setToolTip("Abre este clipe no Editor em Camadas para finalizar o vídeo.")
+        self.send_to_montage_btn.clicked.connect(self._send_selected_clip_to_montage)
+        controls_layout.addWidget(self.send_to_montage_btn)
         controls_layout.addStretch(1)
         preview_layout.addLayout(controls_layout)
-        right_layout.addWidget(preview_group, 2)
+        right_layout.addWidget(preview_group, 0)
 
         info_group = QGroupBox("Informações do clipe")
+        info_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         info_layout = QVBoxLayout(info_group)
         self.info_label = QLabel("Selecione um clipe para ver os detalhes.")
         self.info_label.setWordWrap(True)
+        self.info_label.setMaximumHeight(80)
+        self.info_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.info_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         info_layout.addWidget(self.info_label)
         info_layout.addWidget(QLabel("Descrição:"))
         self.description_edit = QTextEdit()
         self.description_edit.setPlaceholderText("Descrição do clipe exportado...")
-        self.description_edit.setMinimumHeight(170)
-        self.description_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self.description_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.description_edit.setLineWrapMode(QTextEdit.WidgetWidth)
+        self._configure_multiline_text_box(self.description_edit, min_height=180)
         info_layout.addWidget(self.description_edit)
 
         info_layout.addWidget(QLabel("Tipo do clipe:"))
@@ -658,115 +835,16 @@ class ClipLibraryView(QWidget):
 
         info_layout.addWidget(ai_group)
 
-        subtitle_group = QGroupBox("Legendas PT-BR")
-        subtitle_layout = QVBoxLayout(subtitle_group)
-        subtitle_help = QLabel(
-            "Gera a legenda final sempre em PT-BR. Fluxo: usa PT-BR do arquivo; se não tiver, traduz legenda existente; se não houver legenda, usa API pelo áudio."
+        moved_group = QGroupBox("Complementos movidos para Montagem")
+        moved_layout = QVBoxLayout(moved_group)
+        moved_label = QLabel(
+            "Legenda PT-BR, roteiro, narração, legenda do narrador, post e hashtags agora ficam na aba Montagem / Editor. "
+            "A Biblioteca de Clipes fica focada em organizar, pré-visualizar e enviar o vídeo base para edição."
         )
-        subtitle_help.setWordWrap(True)
-        subtitle_layout.addWidget(subtitle_help)
-
-        self.subtitle_status_label = QLabel("Selecione um clipe para ver o status da legenda.")
-        self.subtitle_status_label.setWordWrap(True)
-        self.subtitle_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        subtitle_layout.addWidget(self.subtitle_status_label)
-
-        subtitle_actions = QHBoxLayout()
-        self.generate_subtitle_btn = QPushButton("Gerar legenda PT-BR")
-        self.generate_subtitle_btn.clicked.connect(self._on_generate_current_subtitle)
-        subtitle_actions.addWidget(self.generate_subtitle_btn, 1)
-        self.export_subtitled_btn = QPushButton("Exportar MP4 legendado")
-        self.export_subtitled_btn.clicked.connect(self._on_export_current_subtitled)
-        subtitle_actions.addWidget(self.export_subtitled_btn, 1)
-        subtitle_layout.addLayout(subtitle_actions)
-
-        subtitle_actions_2 = QHBoxLayout()
-        self.open_subtitle_btn = QPushButton("Abrir legenda")
-        self.open_subtitle_btn.clicked.connect(self._open_selected_subtitle)
-        subtitle_actions_2.addWidget(self.open_subtitle_btn, 1)
-        subtitle_layout.addLayout(subtitle_actions_2)
-
-        info_layout.addWidget(subtitle_group)
-
-        narration_group = QGroupBox("Roteiro e narração")
-        narration_layout = QVBoxLayout(narration_group)
-        narration_help = QLabel(
-            "Gera texto para narrador apresentar o anime/clipe. Usa descrição, tags e legenda PT-BR quando existir."
-        )
-        narration_help.setWordWrap(True)
-        narration_layout.addWidget(narration_help)
-
-        self.narration_status_label = QLabel("Selecione um clipe para ver o status do roteiro.")
-        self.narration_status_label.setWordWrap(True)
-        self.narration_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        narration_layout.addWidget(self.narration_status_label)
-
-        narration_options = QHBoxLayout()
-        narration_options.addWidget(QLabel("Estilo:"))
-        self.narration_style_combo = QComboBox()
-        self.narration_style_combo.addItems([
-            "Empolgado", "Misterioso", "Informativo", "Engraçado leve",
-            "Dramático", "Review/Indicação", "TEDVHS direto"
-        ])
-        narration_options.addWidget(self.narration_style_combo, 1)
-        narration_options.addWidget(QLabel("Tamanho:"))
-        self.narration_length_combo = QComboBox()
-        self.narration_length_combo.addItems([
-            "Curto 20-30s", "Médio 45-60s", "Longo 75-90s"
-        ])
-        narration_options.addWidget(self.narration_length_combo, 1)
-        narration_layout.addLayout(narration_options)
-
-        narration_layout.addWidget(QLabel("Roteiro para narrador:"))
-        self.narration_script_edit = QTextEdit()
-        self.narration_script_edit.setPlaceholderText("O roteiro gerado para a narração aparecerá aqui...")
-        self.narration_script_edit.setMinimumHeight(150)
-        self.narration_script_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self.narration_script_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.narration_script_edit.setLineWrapMode(QTextEdit.WidgetWidth)
-        narration_layout.addWidget(self.narration_script_edit)
-
-        narration_layout.addWidget(QLabel("Título sugerido:"))
-        self.tiktok_title_edit = QLineEdit()
-        self.tiktok_title_edit.setPlaceholderText("Título curto para TikTok/Reels/Shorts")
-        narration_layout.addWidget(self.tiktok_title_edit)
-
-        narration_layout.addWidget(QLabel("Texto para publicação:"))
-        self.tiktok_caption_edit = QTextEdit()
-        self.tiktok_caption_edit.setPlaceholderText("Texto da publicação para copiar e colar...")
-        self.tiktok_caption_edit.setMinimumHeight(120)
-        self.tiktok_caption_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self.tiktok_caption_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.tiktok_caption_edit.setLineWrapMode(QTextEdit.WidgetWidth)
-        narration_layout.addWidget(self.tiktok_caption_edit)
-
-        narration_layout.addWidget(QLabel("Hashtags:"))
-        self.narration_hashtags_edit = QLineEdit()
-        self.narration_hashtags_edit.setPlaceholderText("Até 5 hashtags, ex.: #anime #otaku #isekai #tedvhs #animes")
-        narration_layout.addWidget(self.narration_hashtags_edit)
-
-        narration_actions = QHBoxLayout()
-        self.generate_narration_btn = QPushButton("Gerar roteiro com IA")
-        self.generate_narration_btn.clicked.connect(self._on_generate_current_narration)
-        narration_actions.addWidget(self.generate_narration_btn, 1)
-        self.save_narration_btn = QPushButton("Salvar roteiro")
-        self.save_narration_btn.clicked.connect(self._save_narration_metadata)
-        narration_actions.addWidget(self.save_narration_btn, 1)
-        narration_layout.addLayout(narration_actions)
-
-        narration_actions_2 = QHBoxLayout()
-        self.copy_post_btn = QPushButton("Copiar post + hashtags")
-        self.copy_post_btn.setToolTip("Copia apenas o texto da publicação com as hashtags, pronto para colar no TikTok/Reels/Shorts.")
-        self.copy_post_btn.clicked.connect(self._copy_tiktok_post_package)
-        narration_actions_2.addWidget(self.copy_post_btn, 1)
-        self.copy_narration_btn = QPushButton("Copiar pacote completo")
-        self.copy_narration_btn.setToolTip("Copia título, roteiro, texto da publicação e hashtags.")
-        self.copy_narration_btn.clicked.connect(self._copy_narration_package)
-        narration_actions_2.addWidget(self.copy_narration_btn, 1)
-        narration_layout.addLayout(narration_actions_2)
-
-        info_layout.addWidget(narration_group)
-        right_layout.addWidget(info_group, 1)
+        moved_label.setWordWrap(True)
+        moved_layout.addWidget(moved_label)
+        info_layout.addWidget(moved_group)
+        right_layout.addWidget(info_group, 0)
 
         danger_layout = QHBoxLayout()
         self.rename_btn = QPushButton("Renomear clipe")
@@ -780,6 +858,8 @@ class ClipLibraryView(QWidget):
         right_scroll.setWidget(right_widget)
         splitter.addWidget(right_scroll)
         splitter.setSizes([720, 620])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
 
         self.audio_output = QAudioOutput(self)
         self.player = QMediaPlayer(self)
@@ -788,6 +868,13 @@ class ClipLibraryView(QWidget):
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
         self.player.playbackStateChanged.connect(self._on_playback_state_changed)
+
+        # Player separado para áudio de narração. Assim ouvir o MP3 não troca a fonte
+        # do preview do clipe e não causa reset/bug no play-pause do vídeo.
+        self.narration_audio_output = QAudioOutput(self)
+        self.narration_audio_player = QMediaPlayer(self)
+        self.narration_audio_player.setAudioOutput(self.narration_audio_output)
+        self.narration_audio_player.playbackStateChanged.connect(self._on_narration_audio_state_changed)
 
     def refresh_clips(self) -> None:
         """Recarregar clipes exportados do banco."""
@@ -816,7 +903,8 @@ class ClipLibraryView(QWidget):
                     "description", "tags", "scene_type", "segments", "export_mode",
                     "subtitles_ptbr", "subtitle_srt_path", "subtitle_ass_path", "legendado_path",
                     "narration_package", "narration_script", "narration_hook", "tiktok_title",
-                    "tiktok_caption", "hashtags", "narration_style", "narration_length"
+                    "tiktok_caption", "hashtags", "narration_style", "narration_length",
+                    "narration_audio_path", "narration_voice", "narration_rate", "narrated_video_path"
                 ):
                     if payload.get(key) and not data.get(key):
                         data[key] = payload.get(key)
@@ -952,10 +1040,13 @@ class ClipLibraryView(QWidget):
 
     def _load_clip(self, clip: Dict[str, Any]) -> None:
         self._selected_clip = clip
+        self._stop_narration_audio(reset_button=True)
         self._stop_preview(clear_source=False)
         output_path = Path(str(clip.get("output_path") or ""))
         if output_path.exists():
+            self.player.setVideoOutput(self.video_widget)
             self.player.setSource(QUrl.fromLocalFile(str(output_path)))
+            self.player.setPosition(0)
         else:
             self.player.setSource(QUrl())
         self.description_edit.setPlainText(str(clip.get("description") or ""))
@@ -977,29 +1068,54 @@ class ClipLibraryView(QWidget):
         )
         self._update_subtitle_status_label(clip)
         self._load_narration_fields(clip)
+        self._update_narration_audio_status_label(clip)
         self.current_time_label.setText("00:00:00.000")
         self.total_time_label.setText(self._format_time(float(clip.get("duration_seconds") or 0.0)))
         self.timeline_slider.setValue(0)
         self.play_btn.setText("▶ Play")
 
     def _toggle_play_pause(self) -> None:
+        """Alternar play/pause sem recarregar o arquivo e sem voltar ao início."""
         if not self._selected_clip:
             return
         output_path = Path(str(self._selected_clip.get("output_path") or ""))
         if not output_path.exists():
             QMessageBox.warning(self, "Arquivo não encontrado", f"O clipe não foi encontrado:\n{output_path}")
-            return
-        if self.player.source().isEmpty():
+
+        try:
+            self.player.setVideoOutput(self.video_widget)
+        except Exception:
+            pass
+
+        # A comparação por string quebrava no Windows por diferença entre / e \.
+        # Quando isso falhava, o app recarregava o MP4 a cada clique e parecia que
+        # o pause reiniciava o vídeo. Agora só troca a fonte quando é outro arquivo.
+        if not self._player_source_matches(self.player, output_path):
             self.player.setSource(QUrl.fromLocalFile(str(output_path)))
+            self.player.setPosition(0)
+
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
-        else:
-            self.player.play()
+            self.play_btn.setText("▶ Continuar")
+            return
+
+        if self.player.mediaStatus() == QMediaPlayer.EndOfMedia:
+            self.player.setPosition(0)
+        self.player.play()
 
     def _stop_preview(self, clear_source: bool = False) -> None:
+        """Parar o preview sem trocar a fonte. O próximo play começa do início."""
         self.player.stop()
+        try:
+            self.player.setVideoOutput(self.video_widget)
+        except Exception:
+            pass
         if clear_source:
             self.player.setSource(QUrl())
+        else:
+            self.player.setPosition(0)
+        self.timeline_slider.setValue(0)
+        self.current_time_label.setText("00:00:00.000")
         self.play_btn.setText("▶ Play")
 
     def _on_position_changed(self, position: int) -> None:
@@ -1012,8 +1128,11 @@ class ClipLibraryView(QWidget):
         self.total_time_label.setText(self._format_time(duration / 1000.0))
 
     def _on_playback_state_changed(self, _state) -> None:
-        if self.player.playbackState() == QMediaPlayer.PlayingState:
+        state = self.player.playbackState()
+        if state == QMediaPlayer.PlayingState:
             self.play_btn.setText("⏸ Pausar")
+        elif state == QMediaPlayer.PausedState:
+            self.play_btn.setText("▶ Continuar")
         else:
             self.play_btn.setText("▶ Play")
 
@@ -1133,14 +1252,11 @@ class ClipLibraryView(QWidget):
         menu.addAction(play_action)
         menu.addAction("Abrir arquivo", self._open_selected_file)
         menu.addAction("Abrir pasta", self._open_selected_folder)
+        menu.addAction("Enviar para montagem", self._send_selected_clip_to_montage)
         menu.addSeparator()
         menu.addAction("Renomear clipe", self._rename_selected_clip)
         menu.addAction("Salvar descrição/tags", self._save_clip_metadata)
         menu.addAction("Analisar clipe com IA", self._on_analyze_current_clip_ai)
-        menu.addAction("Gerar legenda PT-BR", self._on_generate_current_subtitle)
-        menu.addAction("Exportar MP4 legendado", self._on_export_current_subtitled)
-        menu.addAction("Gerar roteiro/narração", self._on_generate_current_narration)
-        menu.addAction("Salvar roteiro/narração", self._save_narration_metadata)
         menu.addSeparator()
         menu.addAction("Excluir clipe", self._delete_selected_clips)
         menu.addSeparator()
@@ -1159,6 +1275,8 @@ class ClipLibraryView(QWidget):
             "titulo_tiktok": package.get("titulo_tiktok") or clip.get("tiktok_title") or metadata.get("tiktok_title") or "",
             "texto_tiktok": package.get("texto_tiktok") or clip.get("tiktok_caption") or metadata.get("tiktok_caption") or "",
             "hashtags": package.get("hashtags") or clip.get("hashtags") or metadata.get("hashtags") or [],
+            "narration_blocks": package.get("narration_blocks") or metadata.get("narration_blocks") or [],
+            "narrator_subtitle_path": metadata.get("narrator_subtitle_path") or "",
             "cta": package.get("cta") or metadata.get("cta") or "",
             "estilo": package.get("estilo") or clip.get("narration_style") or metadata.get("narration_style") or "Empolgado",
             "tamanho": package.get("tamanho") or clip.get("narration_length") or metadata.get("narration_length") or "Médio 45-60s",
@@ -1177,6 +1295,13 @@ class ClipLibraryView(QWidget):
             hashtags_text = str(hashtags or "")
         if hasattr(self, "narration_script_edit"):
             self.narration_script_edit.setPlainText(script)
+        if hasattr(self, "narration_blocks_edit"):
+            blocks = data.get("narration_blocks") or []
+            if isinstance(blocks, str):
+                blocks = [line.strip() for line in blocks.splitlines() if line.strip()]
+            if not blocks and script:
+                blocks = self._split_text_into_narration_blocks(script)
+            self.narration_blocks_edit.setPlainText("\n".join(str(block) for block in blocks if str(block).strip()))
         if hasattr(self, "tiktok_title_edit"):
             self.tiktok_title_edit.setText(title)
         if hasattr(self, "tiktok_caption_edit"):
@@ -1186,7 +1311,7 @@ class ClipLibraryView(QWidget):
         if hasattr(self, "narration_style_combo"):
             self._set_combo_text(self.narration_style_combo, str(data.get("estilo") or "Empolgado"))
         if hasattr(self, "narration_length_combo"):
-            self._set_combo_text(self.narration_length_combo, str(data.get("tamanho") or "Médio 45-60s"))
+            self._set_combo_text(self.narration_length_combo, str(data.get("tamanho") or "Acompanhar clipe inteiro"))
         self._update_narration_status_label(clip)
 
     def _update_narration_status_label(self, clip: Dict[str, Any]) -> None:
@@ -1280,8 +1405,12 @@ class ClipLibraryView(QWidget):
             QMessageBox.warning(self, "Roteiro de narração", "A API respondeu, mas o roteiro veio vazio.")
             self._set_narration_buttons_enabled(True)
             return
+        generated_script = str(result.get("roteiro_narracao") or "")
+        generated_blocks = self._split_text_into_narration_blocks(generated_script)
         if hasattr(self, "narration_script_edit"):
-            self.narration_script_edit.setPlainText(str(result.get("roteiro_narracao") or ""))
+            self.narration_script_edit.setPlainText(generated_script)
+        if hasattr(self, "narration_blocks_edit"):
+            self.narration_blocks_edit.setPlainText("\n".join(generated_blocks))
         if hasattr(self, "tiktok_title_edit"):
             self.tiktok_title_edit.setText(str(result.get("titulo_tiktok") or ""))
         if hasattr(self, "tiktok_caption_edit"):
@@ -1296,16 +1425,19 @@ class ClipLibraryView(QWidget):
                 "modelo": payload.get("model"),
                 "estilo": payload.get("style"),
                 "tamanho": payload.get("length"),
+                "narration_blocks": generated_blocks,
             })
             self._update_metadata_json(clip, {
                 "narration_package": package,
                 "narration_script": result.get("roteiro_narracao"),
+                "narration_blocks": generated_blocks,
                 "narration_hook": result.get("gancho"),
                 "tiktok_title": result.get("titulo_tiktok"),
                 "tiktok_caption": result.get("texto_tiktok"),
                 "hashtags": hashtags_text,
                 "narration_style": payload.get("style"),
                 "narration_length": payload.get("length"),
+                "narration_target_seconds": payload.get("target_seconds"),
                 "narration_model": payload.get("model"),
             })
         self.status_label.setText("Roteiro de narração gerado e salvo no JSON do clipe.")
@@ -1317,8 +1449,9 @@ class ClipLibraryView(QWidget):
         self._set_narration_buttons_enabled(True)
 
     def _on_narration_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "Roteiro de narração", message)
-        self.status_label.setText(f"Roteiro falhou: {message}")
+        friendly = _friendly_gemini_error(message)
+        QMessageBox.warning(self, "Roteiro de narração", friendly)
+        self.status_label.setText(f"Roteiro falhou: {friendly}")
         self._set_narration_buttons_enabled(True)
 
     def _clear_narration_worker(self) -> None:
@@ -1327,16 +1460,444 @@ class ClipLibraryView(QWidget):
         self._set_narration_buttons_enabled(True)
 
     def _set_narration_buttons_enabled(self, enabled: bool) -> None:
-        for attr in ("generate_narration_btn", "save_narration_btn", "copy_narration_btn", "copy_post_btn"):
+        for attr in (
+            "generate_narration_btn", "save_narration_btn", "copy_narration_btn", "copy_post_btn",
+            "generate_narration_audio_btn", "play_narration_audio_btn", "open_narration_audio_btn",
+            "export_narrated_video_btn",
+        ):
             button = getattr(self, attr, None)
             if button is not None:
                 button.setEnabled(enabled)
+
+
+    def _narration_audio_data_for_clip(self, clip: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = clip.get("metadata_json") if isinstance(clip.get("metadata_json"), dict) else {}
+        output_path = Path(str(clip.get("output_path") or metadata.get("output_path") or ""))
+        audio_path = (
+            clip.get("narration_audio_path")
+            or clip.get("audio_narration_path")
+            or metadata.get("narration_audio_path")
+            or metadata.get("audio_narration_path")
+            or ""
+        )
+        if not audio_path and output_path.name:
+            candidate = output_path.with_name(f"{output_path.stem} narração.mp3")
+            if candidate.exists():
+                audio_path = str(candidate)
+        narrated_video_path = clip.get("narrated_video_path") or metadata.get("narrated_video_path") or ""
+        if not narrated_video_path and output_path.name:
+            candidate = output_path.with_name(f"{output_path.stem} com narração.mp4")
+            if candidate.exists():
+                narrated_video_path = str(candidate)
+        return {
+            "audio_path": str(audio_path or ""),
+            "voice": str(clip.get("narration_voice") or metadata.get("narration_voice") or DEFAULT_TTS_VOICE),
+            "rate": str(clip.get("narration_rate") or metadata.get("narration_rate") or DEFAULT_TTS_RATE),
+            "narrated_video_path": str(narrated_video_path or ""),
+            "engine": str(metadata.get("narration_audio_engine") or "edge-tts"),
+        }
+
+    def _update_narration_audio_status_label(self, clip: Dict[str, Any]) -> None:
+        label = getattr(self, "narration_audio_status_label", None)
+        if label is None:
+            return
+        data = self._narration_audio_data_for_clip(clip)
+        audio_path = Path(str(data.get("audio_path") or ""))
+        video_path = Path(str(data.get("narrated_video_path") or ""))
+        if audio_path.exists():
+            text = f"Status: áudio de narração pronto.\nÁudio: {audio_path}"
+            if video_path.exists():
+                text += f"\nVídeo com narração: {video_path}"
+            label.setText(text)
+        else:
+            label.setText(
+                "Status: sem áudio de narração salvo para este clipe.\n"
+                "Gere ou cole o roteiro acima e clique em ‘Gerar áudio da narração’."
+            )
+
+    def _current_narration_blocks(self) -> List[str]:
+        edit = getattr(self, "narration_blocks_edit", None)
+        if edit is None:
+            return []
+        lines = []
+        for line in edit.toPlainText().splitlines():
+            cleaned = self._clean_narration_block_line(line)
+            if cleaned:
+                lines.append(cleaned)
+        return lines
+
+    def _current_narration_script_text(self) -> str:
+        blocks = self._current_narration_blocks()
+        if blocks:
+            return "\n\n".join(blocks).strip()
+        if hasattr(self, "narration_script_edit"):
+            return self.narration_script_edit.toPlainText().strip()
+        return ""
+
+    @staticmethod
+    def _clean_narration_block_line(line: str) -> str:
+        cleaned = str(line or "").strip()
+        cleaned = re.sub(r"^[-•*\d\.\)\s]+", "", cleaned).strip()
+        cleaned = re.sub(r"^\[[0-9:.,\- >]+\]\s*", "", cleaned).strip()
+        return cleaned
+
+    def _split_text_into_narration_blocks(self, text: str, max_chars: int = 135) -> List[str]:
+        raw = " ".join(str(text or "").replace("\n", " ").split())
+        if not raw:
+            return []
+        parts = [part.strip() for part in re.split(r"(?<=[.!?。！？])\s+", raw) if part.strip()]
+        if not parts:
+            parts = [raw]
+        blocks: List[str] = []
+        current = ""
+        for part in parts:
+            if not current:
+                current = part
+            elif len(current) + 1 + len(part) <= max_chars:
+                current = f"{current} {part}"
+            else:
+                blocks.append(current.strip())
+                current = part
+        if current:
+            blocks.append(current.strip())
+        return blocks
+
+    def _split_narration_script_into_blocks(self) -> None:
+        script = self.narration_script_edit.toPlainText().strip() if hasattr(self, "narration_script_edit") else ""
+        if not script:
+            QMessageBox.information(self, "Blocos de fala", "Gere ou escreva um roteiro antes de dividir em blocos.")
+            return
+        blocks = self._split_text_into_narration_blocks(script)
+        if hasattr(self, "narration_blocks_edit"):
+            self.narration_blocks_edit.setPlainText("\n".join(blocks))
+        self.status_label.setText(f"Roteiro dividido em {len(blocks)} bloco(s) de fala.")
+
+    def _add_narration_block(self) -> None:
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "Adicionar fala do narrador",
+            "Digite a nova fala que entrará na narração:",
+            "",
+        )
+        if not ok:
+            return
+        cleaned = self._clean_narration_block_line(text)
+        if not cleaned:
+            return
+        existing = self.narration_blocks_edit.toPlainText().rstrip() if hasattr(self, "narration_blocks_edit") else ""
+        new_text = f"{existing}\n{cleaned}".strip()
+        if hasattr(self, "narration_blocks_edit"):
+            self.narration_blocks_edit.setPlainText(new_text)
+        self._apply_narration_blocks_to_script(show_message=False)
+        self.status_label.setText("Fala adicionada aos blocos do narrador.")
+
+    def _apply_narration_blocks_to_script(self, show_message: bool = True) -> None:
+        blocks = self._current_narration_blocks()
+        if not blocks:
+            if show_message:
+                QMessageBox.information(self, "Blocos de fala", "Não há blocos para aplicar.")
+            return
+        script = "\n\n".join(blocks)
+        if hasattr(self, "narration_script_edit"):
+            self.narration_script_edit.setPlainText(script)
+        if show_message:
+            self.status_label.setText(f"{len(blocks)} bloco(s) aplicados ao roteiro principal.")
+
+    def _generate_narrator_subtitle_srt(self) -> None:
+        clip = self._selected_clip
+        if not clip:
+            QMessageBox.information(self, "Legenda do narrador", "Selecione um clipe para gerar a legenda do narrador.")
+            return
+        blocks = self._current_narration_blocks()
+        if not blocks:
+            script = self.narration_script_edit.toPlainText().strip() if hasattr(self, "narration_script_edit") else ""
+            blocks = self._split_text_into_narration_blocks(script)
+        if not blocks:
+            QMessageBox.warning(self, "Legenda do narrador", "Gere ou escreva a narração antes de criar a legenda do narrador.")
+            return
+        audio_data = self._narration_audio_data_for_clip(clip)
+        audio_path = Path(str(audio_data.get("audio_path") or ""))
+        output_path = Path(str(clip.get("output_path") or ""))
+        duration_source = audio_path if audio_path.exists() else output_path
+        duration = self._probe_media_duration_seconds(duration_source)
+        if duration <= 0:
+            duration = max(3.0 * len(blocks), 6.0)
+        srt_text = self._compose_narrator_srt(blocks, duration)
+        base_path = output_path if output_path.name else audio_path
+        if not base_path.name:
+            QMessageBox.warning(self, "Legenda do narrador", "Não encontrei o caminho do clipe para salvar a legenda.")
+            return
+        srt_path = base_path.with_name(f"{base_path.stem} legenda narrador.srt")
+        try:
+            srt_path.write_text(srt_text, encoding="utf-8")
+            self._update_metadata_json(clip, {
+                "narration_blocks": blocks,
+                "narrator_subtitle_path": str(srt_path),
+            })
+            self.status_label.setText(f"Legenda do narrador gerada: {srt_path}")
+            QMessageBox.information(self, "Legenda do narrador", f"Legenda do narrador salva em:\n{srt_path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Legenda do narrador", f"Não foi possível salvar a legenda do narrador:\n{exc}")
+
+    def _compose_narrator_srt(self, blocks: List[str], duration: float) -> str:
+        total_weight = sum(max(len(block), 35) for block in blocks) or len(blocks)
+        cursor = 0.0
+        entries = []
+        for index, block in enumerate(blocks, start=1):
+            weight = max(len(block), 35)
+            block_duration = max(1.8, duration * (weight / total_weight))
+            start = cursor
+            end = min(duration, cursor + block_duration)
+            if index == len(blocks):
+                end = max(end, duration)
+            entries.append(
+                f"{index}\n{self._format_srt_timestamp(start)} --> {self._format_srt_timestamp(end)}\n{block}\n"
+            )
+            cursor = end
+        return "\n".join(entries).strip() + "\n"
+
+    @staticmethod
+    def _format_srt_timestamp(seconds: float) -> str:
+        seconds = max(float(seconds or 0.0), 0.0)
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int(round((seconds - int(seconds)) * 1000))
+        if millis >= 1000:
+            secs += 1
+            millis -= 1000
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+    def _probe_media_duration_seconds(self, path: Path) -> float:
+        if not path or not path.exists():
+            return 0.0
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode == 0:
+                return max(float((result.stdout or "0").strip() or 0.0), 0.0)
+        except Exception:
+            return 0.0
+        return 0.0
+
+    def _on_generate_narration_audio(self) -> None:
+        clip = self._selected_clip
+        if not clip:
+            QMessageBox.information(self, "Narração", "Selecione um clipe exportado para gerar áudio.")
+            return
+        script = self._current_narration_script_text()
+        if not script:
+            QMessageBox.warning(self, "Roteiro vazio", "Gere ou cole o roteiro de narração antes de criar o áudio.")
+            return
+        voice = self.narration_voice_combo.currentText().strip() if hasattr(self, "narration_voice_combo") else DEFAULT_TTS_VOICE
+        rate = self.narration_rate_combo.currentText().strip() if hasattr(self, "narration_rate_combo") else DEFAULT_TTS_RATE
+        self._start_narration_audio_worker(clip, script=script, voice=voice, rate=rate, action="generate_audio")
+
+    def _on_export_video_with_narration(self) -> None:
+        clip = self._selected_clip
+        if not clip:
+            QMessageBox.information(self, "Narração", "Selecione um clipe exportado para exportar vídeo com narração.")
+            return
+        audio_path = self._narration_audio_data_for_clip(clip).get("audio_path") or ""
+        if not Path(str(audio_path)).exists():
+            QMessageBox.warning(self, "Áudio não encontrado", "Gere o áudio da narração antes de exportar o vídeo narrado.")
+            return
+        volume_text = self.narration_background_volume_combo.currentText().strip() if hasattr(self, "narration_background_volume_combo") else "25%"
+        volume = self._volume_text_to_float(volume_text)
+        self._start_narration_audio_worker(clip, script="", voice="", rate="", action="export_video", background_volume=volume)
+
+    def _start_narration_audio_worker(
+        self,
+        clip: Dict[str, Any],
+        script: str,
+        voice: str,
+        rate: str,
+        action: str,
+        background_volume: float = 0.25,
+    ) -> None:
+        if self._narration_audio_thread is not None:
+            QMessageBox.information(self, "Narração em andamento", "Aguarde a operação de áudio terminar.")
+            return
+        if self._ai_thread is not None or self._subtitle_thread is not None or self._narration_thread is not None:
+            QMessageBox.information(self, "Operação em andamento", "Aguarde a operação atual terminar antes de mexer no áudio.")
+            return
+        self._set_narration_buttons_enabled(False)
+        self.status_label.setText("Preparando áudio da narração...")
+        thread = QThread(self)
+        worker = _ClipNarrationAudioWorker(
+            audio_service=self.narration_audio_service,
+            clip=clip,
+            script=script,
+            voice=voice,
+            rate=rate,
+            action=action,
+            background_volume=background_volume,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.status_label.setText)
+        worker.finished.connect(self._on_narration_audio_finished)
+        worker.failed.connect(self._on_narration_audio_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_narration_audio_worker)
+        self._narration_audio_thread = thread
+        self._narration_audio_worker = worker
+        thread.start()
+
+    def _on_narration_audio_finished(self, payload: Dict[str, Any]) -> None:
+        clip = self._selected_clip
+        if not clip:
+            self._set_narration_buttons_enabled(True)
+            return
+        action = str(payload.get("action") or "")
+        updates: Dict[str, Any] = {}
+        registered_id = None
+        if action == "export_video":
+            updates = {
+                "narrated_video_path": payload.get("narrated_video_path"),
+                "narration_audio_path": payload.get("audio_path"),
+                "narration_background_volume": payload.get("background_volume"),
+            }
+            registered_id = self._register_derived_clip(
+                source_clip=clip,
+                output_path=payload.get("narrated_video_path"),
+                variant_label="narrado",
+                export_mode="narrated_video",
+                extra_metadata={
+                    "narrated_video_path": payload.get("narrated_video_path"),
+                    "narration_audio_path": payload.get("audio_path"),
+                    "narration_background_volume": payload.get("background_volume"),
+                    "description": clip.get("description") or "",
+                    "tags": self._append_unique_tags(self._tags_text(clip), ["narrado"]),
+                    "scene_type": clip.get("scene_type") or "Geral",
+                },
+            )
+            self.status_label.setText("Vídeo com narração exportado com sucesso.")
+            message = f"Vídeo exportado:\n{payload.get('narrated_video_path')}"
+            if registered_id:
+                message += "\n\nEle também foi adicionado à Biblioteca de Clipes."
+            QMessageBox.information(self, "Vídeo narrado pronto", message)
+        else:
+            updates = {
+                "narration_audio_path": payload.get("audio_path"),
+                "narration_voice": payload.get("voice"),
+                "narration_rate": payload.get("rate"),
+                "narration_audio_engine": payload.get("engine"),
+            }
+            audio_path = Path(str(payload.get("audio_path") or ""))
+            clip_path = Path(str(clip.get("output_path") or ""))
+            audio_duration = self._probe_media_duration_seconds(audio_path)
+            clip_duration = self._probe_media_duration_seconds(clip_path)
+            updates["narration_audio_duration_seconds"] = audio_duration
+            updates["narration_clip_duration_seconds"] = clip_duration
+            self.status_label.setText("Áudio da narração gerado com sucesso.")
+            message = f"Áudio gerado:\n{payload.get('audio_path')}"
+            if audio_duration > 0 and clip_duration > 0:
+                message += f"\n\nDuração do áudio: {self._format_time(audio_duration)} | Duração do clipe: {self._format_time(clip_duration)}"
+                if audio_duration < clip_duration * 0.70:
+                    message += (
+                        "\n\nAtenção: a narração ficou bem mais curta que o vídeo. "
+                        "Para cobrir o vídeo inteiro, gere o roteiro com a opção ‘Acompanhar clipe inteiro’ e gere o áudio novamente."
+                    )
+                elif audio_duration > clip_duration * 1.20:
+                    message += (
+                        "\n\nAtenção: a narração ficou maior que o vídeo. "
+                        "Você pode reduzir o roteiro, aumentar a velocidade ou gerar uma versão mais curta."
+                    )
+            QMessageBox.information(self, "Narração pronta", message)
+        self._update_metadata_json(clip, updates)
+        current_id = int(clip.get("id")) if clip.get("id") else None
+        self.refresh_clips()
+        if registered_id is not None:
+            self._select_clip_by_id(int(registered_id))
+        elif current_id is not None:
+            self._select_clip_by_id(current_id)
+        self._set_narration_buttons_enabled(True)
+
+    def _on_narration_audio_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "Áudio da narração", message)
+        self.status_label.setText(f"Áudio da narração falhou: {message}")
+        self._set_narration_buttons_enabled(True)
+
+    def _clear_narration_audio_worker(self) -> None:
+        self._narration_audio_thread = None
+        self._narration_audio_worker = None
+        self._set_narration_buttons_enabled(True)
+
+    def _play_narration_audio(self) -> None:
+        clip = self._selected_clip
+        if not clip:
+            return
+        path = Path(str(self._narration_audio_data_for_clip(clip).get("audio_path") or ""))
+        if not path.exists():
+            QMessageBox.warning(self, "Áudio não encontrado", "Gere o áudio da narração primeiro.")
+            return
+        try:
+            # Pausa o vídeo, mas mantém o preview carregado. O áudio usa outro player.
+            if self.player.playbackState() == QMediaPlayer.PlayingState:
+                self.player.pause()
+            if not self._player_source_matches(self.narration_audio_player, path):
+                self.narration_audio_player.setSource(QUrl.fromLocalFile(str(path)))
+                self.narration_audio_player.setPosition(0)
+            if self.narration_audio_player.playbackState() == QMediaPlayer.PlayingState:
+                self.narration_audio_player.pause()
+                self.status_label.setText("Narração pausada.")
+            else:
+                self.narration_audio_player.play()
+                self.status_label.setText("Reproduzindo áudio da narração...")
+        except Exception as exc:
+            QMessageBox.warning(self, "Não foi possível tocar", str(exc))
+
+    def _stop_narration_audio(self, reset_button: bool = True) -> None:
+        try:
+            if hasattr(self, "narration_audio_player"):
+                self.narration_audio_player.stop()
+                self.narration_audio_player.setPosition(0)
+            if reset_button and hasattr(self, "play_narration_audio_btn"):
+                self.play_narration_audio_btn.setText("Ouvir narração")
+        except Exception:
+            pass
+
+    def _on_narration_audio_state_changed(self, _state) -> None:
+        if not hasattr(self, "play_narration_audio_btn"):
+            return
+        if self.narration_audio_player.playbackState() == QMediaPlayer.PlayingState:
+            self.play_narration_audio_btn.setText("⏸ Pausar narração")
+        elif self.narration_audio_player.playbackState() == QMediaPlayer.PausedState:
+            self.play_narration_audio_btn.setText("▶ Continuar narração")
+        else:
+            self.play_narration_audio_btn.setText("Ouvir narração")
+
+    def _open_narration_audio(self) -> None:
+        clip = self._selected_clip
+        if not clip:
+            return
+        path = Path(str(self._narration_audio_data_for_clip(clip).get("audio_path") or ""))
+        if path.exists():
+            self._open_path(path)
+        else:
+            QMessageBox.warning(self, "Áudio não encontrado", "Gere o áudio da narração primeiro.")
+
+    def _volume_text_to_float(self, text: str) -> float:
+        try:
+            cleaned = str(text or "25%").strip().replace("%", "").replace(",", ".")
+            return max(0.0, min(float(cleaned) / 100.0, 1.0))
+        except Exception:
+            return 0.25
 
     def _save_narration_metadata(self) -> None:
         clip = self._selected_clip
         if not clip:
             return
-        script = self.narration_script_edit.toPlainText().strip() if hasattr(self, "narration_script_edit") else ""
+        blocks = self._current_narration_blocks()
+        script = self._current_narration_script_text()
         title = self.tiktok_title_edit.text().strip() if hasattr(self, "tiktok_title_edit") else ""
         caption = self.tiktok_caption_edit.toPlainText().strip() if hasattr(self, "tiktok_caption_edit") else ""
         hashtags = self.narration_hashtags_edit.text().strip() if hasattr(self, "narration_hashtags_edit") else ""
@@ -1345,6 +1906,7 @@ class ClipLibraryView(QWidget):
         package = {
             "gancho": self._first_sentence(script),
             "roteiro_narracao": script,
+            "narration_blocks": blocks,
             "titulo_tiktok": title,
             "texto_tiktok": caption,
             "hashtags": hashtags,
@@ -1356,6 +1918,7 @@ class ClipLibraryView(QWidget):
             self._update_metadata_json(clip, {
                 "narration_package": package,
                 "narration_script": script,
+                "narration_blocks": blocks,
                 "narration_hook": package.get("gancho"),
                 "tiktok_title": title,
                 "tiktok_caption": caption,
@@ -1388,7 +1951,8 @@ class ClipLibraryView(QWidget):
 
     def _copy_narration_package(self) -> None:
         """Copia título, roteiro, texto de post e hashtags para a área de transferência."""
-        script = self.narration_script_edit.toPlainText().strip() if hasattr(self, "narration_script_edit") else ""
+        blocks = self._current_narration_blocks()
+        script = self._current_narration_script_text()
         title = self.tiktok_title_edit.text().strip() if hasattr(self, "tiktok_title_edit") else ""
         caption = self.tiktok_caption_edit.toPlainText().strip() if hasattr(self, "tiktok_caption_edit") else ""
         hashtags = self.narration_hashtags_edit.text().strip() if hasattr(self, "narration_hashtags_edit") else ""
@@ -1537,12 +2101,33 @@ class ClipLibraryView(QWidget):
         clip_id = result.get("id")
         if result.get("action") == "burn":
             legendado_path = result.get("legendado_path")
+            registered_id = None
             if clip:
                 self._update_metadata_json(clip, {"legendado_path": legendado_path})
+                registered_id = self._register_derived_clip(
+                    source_clip=clip,
+                    output_path=legendado_path,
+                    variant_label="legendado PT-BR",
+                    export_mode="burned_subtitles_ptbr",
+                    extra_metadata={
+                        "legendado_path": legendado_path,
+                        "subtitle_path": result.get("subtitle_path"),
+                        "description": clip.get("description") or "",
+                        "tags": self._append_unique_tags(self._tags_text(clip), ["legendado", "pt-br"]),
+                        "scene_type": clip.get("scene_type") or "Geral",
+                    },
+                )
             self.status_label.setText(f"MP4 legendado exportado: {legendado_path}")
-            QMessageBox.information(self, "MP4 legendado", f"Vídeo legendado criado com sucesso:\n{legendado_path}")
+            message = f"Vídeo legendado criado com sucesso:\n{legendado_path}"
+            if registered_id:
+                message += "\n\nEle também foi adicionado à Biblioteca de Clipes."
+            else:
+                message += "\n\nArquivo criado. Se ele já existia na biblioteca, a lista foi apenas atualizada."
+            QMessageBox.information(self, "MP4 legendado", message)
             self.refresh_clips()
-            if clip_id:
+            if registered_id:
+                self._select_clip_by_id(int(registered_id))
+            elif clip_id:
                 self._select_clip_by_id(int(clip_id))
             self._set_subtitle_buttons_enabled(True)
             return
@@ -1583,8 +2168,9 @@ class ClipLibraryView(QWidget):
         self._set_subtitle_buttons_enabled(True)
 
     def _on_subtitle_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "Legenda PT-BR", message)
-        self.status_label.setText(f"Legenda falhou: {message}")
+        friendly = _friendly_gemini_error(message)
+        QMessageBox.warning(self, "Legenda PT-BR", friendly)
+        self.status_label.setText(f"Legenda falhou: {friendly}")
         self._set_subtitle_buttons_enabled(True)
 
     def _clear_subtitle_worker(self) -> None:
@@ -1761,8 +2347,9 @@ class ClipLibraryView(QWidget):
         self._set_ai_buttons_enabled(True)
 
     def _on_clip_ai_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "IA do clipe", message)
-        self.status_label.setText(f"IA do clipe falhou: {message}")
+        friendly = _friendly_gemini_error(message)
+        QMessageBox.warning(self, "IA do clipe", friendly)
+        self.status_label.setText(f"IA do clipe falhou: {friendly}")
         self._set_ai_buttons_enabled(True)
 
     def _clear_ai_worker(self) -> None:
@@ -1833,11 +2420,13 @@ class ClipLibraryView(QWidget):
             self.status_label.setText(f"Gemini OK. Modelo selecionado: {result.get('model') or model}")
             self._maybe_save_gemini_settings(api_key, result.get('model') or model)
         except GeminiSceneAIError as exc:
-            QMessageBox.warning(self, "Gemini não disponível", str(exc))
-            self.status_label.setText(f"Gemini não disponível: {exc}")
+            friendly = _friendly_gemini_error(exc)
+            QMessageBox.warning(self, "Gemini não disponível", friendly)
+            self.status_label.setText(f"Gemini não disponível: {friendly}")
         except Exception as exc:
-            QMessageBox.warning(self, "Gemini não disponível", f"Não foi possível conectar à Gemini API: {exc}")
-            self.status_label.setText(f"Gemini não disponível: {exc}")
+            friendly = _friendly_gemini_error(exc)
+            QMessageBox.warning(self, "Gemini não disponível", friendly)
+            self.status_label.setText(f"Gemini não disponível: {friendly}")
 
     def _set_combo_text(self, combo: QComboBox, value: str) -> None:
         text = str(value or "").strip() or "Geral"
@@ -1848,16 +2437,38 @@ class ClipLibraryView(QWidget):
         combo.setCurrentIndex(max(index, 0))
 
     def _release_player_file_handles(self) -> None:
-        """Liberar o arquivo do player antes de renomear/excluir no Windows."""
+        """Liberar arquivos dos players antes de renomear/excluir no Windows."""
         try:
             self.player.stop()
             self.player.setSource(QUrl())
             self.play_btn.setText("▶ Play")
+            if hasattr(self, "narration_audio_player"):
+                self.narration_audio_player.stop()
+                self.narration_audio_player.setSource(QUrl())
+            if hasattr(self, "play_narration_audio_btn"):
+                self.play_narration_audio_btn.setText("Ouvir narração")
             for _ in range(4):
                 QCoreApplication.processEvents()
                 time.sleep(0.03)
         except Exception:
             pass
+
+    def _send_selected_clip_to_montage(self) -> None:
+        """Enviar clipe selecionado para a aba Montagem/Editor."""
+        clip = self._selected_clip
+        if not clip:
+            QMessageBox.information(self, "Montagem", "Selecione um clipe na biblioteca primeiro.")
+            return
+        try:
+            if self.player.playbackState() == QMediaPlayer.PlayingState:
+                self.player.pause()
+                self.play_btn.setText("▶ Play")
+            if hasattr(self, "narration_audio_player") and self.narration_audio_player.playbackState() == QMediaPlayer.PlayingState:
+                self.narration_audio_player.pause()
+        except Exception:
+            pass
+        self.status_label.setText("Clipe enviado para montagem.")
+        self.send_to_montage_requested.emit(dict(clip))
 
     def _open_selected_file(self) -> None:
         clip = self._selected_clip
@@ -1902,6 +2513,147 @@ class ClipLibraryView(QWidget):
                 json.dump(payload, file, ensure_ascii=False, indent=2)
         except Exception as exc:
             logger.warning("Não foi possível atualizar JSON do clipe: %s", exc)
+
+    def _register_derived_clip(
+        self,
+        source_clip: Dict[str, Any],
+        output_path: Any,
+        variant_label: str,
+        export_mode: str,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Registrar MP4 derivado (legendado/narrado) como clipe visível na biblioteca."""
+        path = Path(str(output_path or ""))
+        if not path.exists():
+            return None
+        if not hasattr(self.repository, "save_exported_clip"):
+            logger.warning("Repositório não possui save_exported_clip; derivado não será registrado.")
+            return None
+
+        existing_id = self._find_clip_id_by_output_path(path)
+        if existing_id is not None:
+            return existing_id
+
+        metadata_path = path.with_suffix(".json")
+        source_metadata = self._read_clip_metadata(source_clip)
+        extra = dict(extra_metadata or {})
+        source_segments = self._segments_for_clip(source_clip)
+        inherited_tags = self._tags_text(source_clip) or str(source_metadata.get("tags") or "")
+        tags = str(extra.get("tags") or inherited_tags or "").strip()
+        scene_type = str(extra.get("scene_type") or source_clip.get("scene_type") or source_metadata.get("scene_type") or "Geral").strip() or "Geral"
+        description = str(extra.get("description") or source_clip.get("description") or source_metadata.get("description") or "").strip()
+        duration = self._safe_float(source_clip.get("duration_seconds") or source_metadata.get("duration_seconds"), 0.0)
+
+        payload = dict(source_metadata) if isinstance(source_metadata, dict) else {}
+        payload.update({
+            "clip_name": path.stem,
+            "output_path": str(path),
+            "metadata_path": str(metadata_path),
+            "library_folder": source_clip.get("library_folder") or payload.get("library_folder") or "Sem pasta",
+            "library_season": source_clip.get("library_season") or payload.get("library_season") or "Clipes",
+            "source_library_season": source_clip.get("source_library_season") or payload.get("source_library_season") or source_clip.get("library_season") or "",
+            "source_episode_name": source_clip.get("source_episode_name") or source_clip.get("episode_name") or payload.get("source_episode_name") or "",
+            "episode_name": source_clip.get("episode_name") or payload.get("episode_name") or source_clip.get("source_episode_name") or "",
+            "duration_seconds": duration,
+            "segments": source_segments,
+            "description": description,
+            "tags": tags,
+            "scene_type": scene_type,
+            "narration_package": source_clip.get("narration_package") or source_metadata.get("narration_package") or {},
+            "narration_script": source_clip.get("narration_script") or source_metadata.get("narration_script") or "",
+            "post_text": source_clip.get("post_text") or source_metadata.get("post_text") or "",
+            "hashtags": source_clip.get("hashtags") or source_metadata.get("hashtags") or "",
+            "subtitle_ass_path": extra.get("subtitle_ass_path") or extra.get("ass_path") or source_clip.get("subtitle_ass_path") or source_clip.get("ass_path") or source_metadata.get("subtitle_ass_path") or source_metadata.get("ass_path") or "",
+            "subtitle_path": extra.get("subtitle_path") or extra.get("srt_path") or source_clip.get("subtitle_path") or source_metadata.get("subtitle_path") or "",
+            "narration_audio_path": extra.get("narration_audio_path") or source_clip.get("narration_audio_path") or source_metadata.get("narration_audio_path") or "",
+            "audio_narration_path": extra.get("audio_narration_path") or source_clip.get("audio_narration_path") or source_metadata.get("audio_narration_path") or "",
+            "legendado_path": extra.get("legendado_path") or source_metadata.get("legendado_path") or "",
+            "narrated_video_path": extra.get("narrated_video_path") or source_metadata.get("narrated_video_path") or "",
+            "export_mode": export_mode,
+            "derived_clip": True,
+            "derived_type": variant_label,
+            "derived_from_clip_id": source_clip.get("id"),
+            "derived_from_clip_name": source_clip.get("clip_name"),
+            "derived_from_output_path": source_clip.get("output_path"),
+            "created_by": "TEDVHS Studio",
+        })
+        payload.update(extra)
+        try:
+            metadata_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Não foi possível salvar JSON do clipe derivado %s: %s", metadata_path, exc)
+
+        media_id = source_clip.get("media_id") or source_clip.get("source_media_id") or payload.get("source_media_id")
+        scene_id = source_clip.get("scene_id") or payload.get("scene_id")
+        try:
+            record_id = self.repository.save_exported_clip(
+                media_id=media_id,
+                scene_id=scene_id,
+                clip_name=path.stem,
+                output_path=str(path),
+                metadata_path=str(metadata_path),
+                library_folder=str(payload.get("library_folder") or "Sem pasta"),
+                library_season=str(payload.get("library_season") or "Clipes"),
+                episode_name=str(payload.get("episode_name") or payload.get("source_episode_name") or ""),
+                duration_seconds=duration,
+                segments_json=json.dumps(source_segments, ensure_ascii=False),
+                description=description,
+                tags=tags,
+                scene_type=scene_type,
+                export_mode=export_mode,
+            )
+            return int(record_id) if record_id is not None else None
+        except Exception as exc:
+            logger.warning("Não foi possível registrar clipe derivado na biblioteca: %s", exc, exc_info=True)
+            return None
+
+    def _find_clip_id_by_output_path(self, output_path: Path) -> Optional[int]:
+        target = str(output_path.resolve()).lower()
+        candidates = list(self._all_clips or [])
+        try:
+            if hasattr(self.repository, "get_exported_clips_all"):
+                candidates.extend(self.repository.get_exported_clips_all() or [])
+        except Exception:
+            pass
+        for clip in candidates:
+            try:
+                candidate = Path(str(clip.get("output_path") or "")).resolve()
+            except Exception:
+                continue
+            if str(candidate).lower() == target and clip.get("id") is not None:
+                return int(clip.get("id"))
+        return None
+
+    def _read_clip_metadata(self, clip: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = clip.get("metadata_json") if isinstance(clip.get("metadata_json"), dict) else {}
+        if metadata:
+            return dict(metadata)
+        metadata_path = Path(str(clip.get("metadata_path") or ""))
+        if metadata_path.exists():
+            try:
+                return json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    def _append_unique_tags(self, current: str, additions: List[str]) -> str:
+        values: List[str] = []
+        for raw in str(current or "").replace(";", ",").split(","):
+            tag = raw.strip()
+            if tag and tag.lower() not in {item.lower() for item in values}:
+                values.append(tag)
+        for raw in additions:
+            tag = str(raw or "").strip()
+            if tag and tag.lower() not in {item.lower() for item in values}:
+                values.append(tag)
+        return ", ".join(values)
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
 
     def _subtitle_sidecar_paths(self, clip: Dict[str, Any]) -> List[Path]:
         output_path = Path(str(clip.get("output_path") or ""))

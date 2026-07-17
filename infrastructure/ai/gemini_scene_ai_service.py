@@ -82,62 +82,8 @@ class GeminiSceneAIService:
         if not frames:
             raise GeminiSceneAIError("Nenhum frame válido foi gerado para enviar à API.")
 
-        selected_frame = self._select_representative_frame(frames)
-        prompt = self._build_prompt(context)
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": prompt},
-                        {
-                            "inline_data": {
-                                "mime_type": self._guess_mime_type(selected_frame),
-                                "data": self._encode_image(selected_frame),
-                            }
-                        },
-                    ],
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.2,
-                "topP": 0.9,
-                "maxOutputTokens": 700,
-            },
-        }
-
-        data = self._generate_content(api_key=api_key, model=model, payload=payload, timeout_seconds=self.timeout_seconds)
-        raw_response = self._extract_response_text(data).strip()
-        if not raw_response:
-            raise GeminiSceneAIError("A API retornou uma resposta vazia.")
-
-        parsed = self._parse_ai_json(raw_response)
-        parsed["modelo"] = model
-        parsed["resposta_bruta"] = raw_response
-        parsed["frames_usados"] = [str(selected_frame)]
-        return parsed
-
-    def describe_clip(
-        self,
-        frame_paths: Sequence[str | Path],
-        context: Dict[str, Any],
-        api_key: str,
-        model: str = DEFAULT_GEMINI_MODEL,
-    ) -> Dict[str, Any]:
-        """Gerar descrição/tags/tipo usando frames de um clipe exportado.
-
-        Diferente da cena isolada, o clipe pode juntar vários trechos. Por isso,
-        o prompt pede uma descrição geral do clipe final e usa até 3 frames
-        comprimidos. Continua leve para o PC: o processamento pesado fica na API.
-        """
-        api_key = self._clean_api_key(api_key)
-        model = self._clean_model_name(model)
-        frames = [Path(path) for path in frame_paths if path and Path(path).exists() and Path(path).stat().st_size > 0]
-        if not frames:
-            raise GeminiSceneAIError("Nenhum frame válido foi gerado para enviar à API.")
-
-        selected_frames = self._select_clip_frames(frames, limit=3)
-        prompt = self._build_clip_prompt(context)
+        selected_frames = self._select_representative_frames(frames, limit=3)
+        prompt = self._build_prompt(context, frame_count=len(selected_frames))
         parts: List[Dict[str, Any]] = [{"text": prompt}]
         for frame in selected_frames:
             parts.append(
@@ -148,7 +94,6 @@ class GeminiSceneAIService:
                     }
                 }
             )
-
         payload = {
             "contents": [
                 {
@@ -157,7 +102,7 @@ class GeminiSceneAIService:
                 }
             ],
             "generationConfig": {
-                "temperature": 0.25,
+                "temperature": 0.15,
                 "topP": 0.9,
                 "maxOutputTokens": 900,
             },
@@ -175,40 +120,78 @@ class GeminiSceneAIService:
         return parsed
 
     def format_description(self, result: Dict[str, Any]) -> str:
-        """Formatar resultado para o campo descrição da cena."""
+        """Formatar resultado para o campo descrição da cena, preservando dados úteis para busca."""
         curta = str(result.get("descricao_curta") or "").strip()
         detalhada = str(result.get("descricao_detalhada") or "").strip()
         potencial = str(result.get("potencial_video") or "").strip()
         uso = str(result.get("sugestao_uso") or "").strip()
         motivo = str(result.get("motivo_potencial") or "").strip()
+        emocao = str(result.get("emocao") or result.get("clima") or "").strip()
+        confianca = str(result.get("confianca") or "").strip()
+
+        def _join_list(value: Any) -> str:
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, list):
+                return ", ".join(str(item).strip() for item in value if str(item).strip())
+            return ""
+
+        elementos = _join_list(result.get("elementos_visuais"))
+        acoes = _join_list(result.get("acoes_visuais") or result.get("acoes"))
+        objetos = _join_list(result.get("objetos_importantes") or result.get("objetos"))
 
         parts: List[str] = []
         if curta:
             parts.append(curta)
         if detalhada and detalhada.lower() != curta.lower():
             parts.append(f"Detalhes: {detalhada}")
+        extras = []
+        if elementos:
+            extras.append(f"Elementos visuais: {elementos}")
+        if acoes:
+            extras.append(f"Ações visuais: {acoes}")
+        if objetos:
+            extras.append(f"Objetos/cenário: {objetos}")
+        if emocao:
+            extras.append(f"Clima/emoção: {emocao}")
+        if extras:
+            parts.append("\n".join(extras))
         if potencial:
             linha = f"Potencial para vídeo curto: {potencial}"
             if motivo:
                 linha += f" — {motivo}"
+            if confianca:
+                linha += f" | Confiança: {confianca}"
             parts.append(linha)
         if uso:
             parts.append(f"Sugestão de uso: {uso}")
         return "\n\n".join(parts).strip() or str(result.get("resposta_bruta") or "").strip()
 
     def normalize_tags(self, result: Dict[str, Any]) -> str:
-        tags = result.get("tags") or []
-        if isinstance(tags, str):
-            raw_items = re.split(r"[,;\n]+", tags)
-        else:
-            raw_items = [str(item) for item in tags]
+        values: List[str] = []
+        for key in [
+            "tags",
+            "elementos_visuais",
+            "acoes_visuais",
+            "acoes",
+            "objetos_importantes",
+            "objetos",
+            "emocao",
+            "clima",
+            "potencial_video",
+        ]:
+            item = result.get(key)
+            if isinstance(item, str):
+                values.extend(re.split(r"[,;\n]+", item))
+            elif isinstance(item, list):
+                values.extend(str(value) for value in item)
         clean: List[str] = []
-        for item in raw_items:
+        for item in values:
             value = str(item or "").strip().lower()
             value = re.sub(r"\s+", " ", value)
             if value and value not in clean:
                 clean.append(value)
-        return ", ".join(clean[:12])
+        return ", ".join(clean[:18])
 
     def normalize_scene_type(self, result: Dict[str, Any]) -> str:
         value = str(result.get("tipo") or result.get("scene_type") or "Geral").strip()
@@ -317,7 +300,7 @@ class GeminiSceneAIService:
             "sugestao_uso": "Revise manualmente antes de usar no vídeo.",
         }
 
-    def _build_prompt(self, context: Dict[str, Any]) -> str:
+    def _build_prompt(self, context: Dict[str, Any], frame_count: int = 1) -> str:
         anime = str(context.get("anime") or "Anime não informado").strip()
         season = str(context.get("season") or "Temporada não informada").strip()
         episode = str(context.get("episode") or "Episódio não informado").strip()
@@ -325,9 +308,10 @@ class GeminiSceneAIService:
         start = str(context.get("start") or "").strip()
         end = str(context.get("end") or "").strip()
         duration = str(context.get("duration") or "").strip()
+        goal = str(context.get("classification_goal") or "").strip()
 
         return f"""
-Analise o frame anexado de uma cena de anime e responda em português do Brasil.
+Analise {frame_count} frame(s) de uma mesma cena de anime e crie um ÍNDICE PESQUISÁVEL em português do Brasil.
 
 Contexto:
 - Anime/Pasta: {anime}
@@ -336,92 +320,52 @@ Contexto:
 - Cena: {display_name}
 - Trecho: {start} até {end}
 - Duração: {duration}
+- Objetivo do índice: {goal or 'permitir buscar cenas por intenção, como explosão, luta, magia, paisagem, humor, tristeza, medo, transformação ou alto potencial para TikTok'}
 
 Regras:
-- Descreva apenas o que é visualmente provável.
+- Use todos os frames anexados como início/meio/fim aproximado da cena.
+- Descreva somente o que é visualmente provável.
 - Não invente nomes de personagens se não estiver claro.
 - Não invente falas.
+- Gere palavras úteis para busca futura.
 - Seja útil para criador de TikTok/Reels/Shorts.
 - Retorne somente JSON válido, sem markdown.
 
 Formato obrigatório:
 {{
-  "descricao_curta": "uma frase curta sobre a cena",
-  "descricao_detalhada": "2 a 3 frases objetivas sobre o que parece acontecer visualmente",
-  "tags": ["tag1", "tag2", "tag3"],
-  "tipo": "Ação | Luta | Diálogo | Comédia | Drama | Suspense | Romance | Transformação | Poder/Habilidade | Revelação | Cena épica | Outro",
+  "descricao_curta": "uma frase curta e pesquisável sobre a cena",
+  "descricao_detalhada": "2 a 4 frases objetivas sobre o que parece acontecer visualmente na sequência",
+  "tags": ["explosão", "fogo", "luta", "magia", "medo", "paisagem", "diálogo", "alto potencial"],
+  "elementos_visuais": ["fogo", "fumaça", "luz intensa", "floresta", "monstro", "personagem assustado"],
+  "acoes_visuais": ["personagem corre", "ataque causa impacto", "personagem observa algo"],
+  "objetos_importantes": ["espada", "criatura", "cidade", "floresta"],
+  "emocao": "tensão | humor | tristeza | empolgação | medo | surpresa | calma | mistério",
+  "tipo": "Ação | Luta | Diálogo | Comédia | Drama | Suspense | Romance | Transformação | Poder/Habilidade | Revelação | Paisagem | Cena épica | Outro",
   "potencial_video": "Baixo | Médio | Alto | Muito alto",
-  "motivo_potencial": "motivo curto",
+  "motivo_potencial": "motivo curto e prático para vídeo curto",
+  "confianca": "Baixa | Média | Alta",
   "sugestao_uso": "como essa cena poderia ser usada em vídeo curto"
 }}
 """.strip()
 
-    def _build_clip_prompt(self, context: Dict[str, Any]) -> str:
-        anime = str(context.get("anime") or "Anime não informado").strip()
-        season = str(context.get("season") or "Temporada não informada").strip()
-        episode = str(context.get("episode") or "Episódio não informado").strip()
-        clip_name = str(context.get("clip_name") or "Clipe exportado").strip()
-        duration = str(context.get("duration") or "").strip()
-        source_range = str(context.get("source_range") or "").strip()
-        segments = str(context.get("segments_summary") or "").strip()
-        existing_scene_notes = str(context.get("scene_notes") or "").strip()
-
-        return f"""
-Analise os frames anexados de um clipe exportado de anime e responda em português do Brasil.
-
-Contexto do clipe:
-- Anime/Pasta: {anime}
-- Temporada de origem: {season}
-- Episódio/Arquivo de origem: {episode}
-- Nome do clipe: {clip_name}
-- Duração do clipe: {duration}
-- Trecho(s) de origem: {source_range}
-- Segmentos usados: {segments}
-- Observações já existentes das cenas: {existing_scene_notes}
-
-Regras:
-- Descreva o clipe final como um todo, não apenas um frame isolado.
-- Não invente nomes de personagens se não estiver claro.
-- Não invente falas.
-- Seja útil para criador de TikTok/Reels/Shorts.
-- Foque em conteúdo, clima, possível uso e gancho visual.
-- Retorne somente JSON válido, sem markdown.
-
-Formato obrigatório:
-{{
-  "descricao_curta": "uma frase curta sobre o clipe",
-  "descricao_detalhada": "2 a 4 frases objetivas sobre o que o clipe parece mostrar",
-  "tags": ["tag1", "tag2", "tag3"],
-  "tipo": "Ação | Luta | Diálogo | Comédia | Drama | Suspense | Romance | Transformação | Poder/Habilidade | Revelação | Cena épica | Exploração | Introdução | Outro",
-  "potencial_video": "Baixo | Médio | Alto | Muito alto",
-  "motivo_potencial": "motivo curto",
-  "sugestao_uso": "como esse clipe poderia ser usado em vídeo curto"
-}}
-""".strip()
-
-    def _select_clip_frames(self, frames: Sequence[Path], limit: int = 3) -> List[Path]:
+    def _select_representative_frames(self, frames: Sequence[Path], limit: int = 3) -> List[Path]:
         valid = [Path(frame) for frame in frames if Path(frame).exists()]
         if not valid:
             raise GeminiSceneAIError("Nenhum frame válido encontrado.")
         if len(valid) <= limit:
             return valid
-        if limit <= 1:
-            return [valid[len(valid) // 2]]
+        # Pegar início, meio e fim aproximados para não analisar só uma “capa”.
         indexes = [0, len(valid) // 2, len(valid) - 1]
         selected: List[Path] = []
-        for index in indexes:
-            frame = valid[max(0, min(index, len(valid) - 1))]
+        for idx in indexes[:limit]:
+            frame = valid[idx]
             if frame not in selected:
                 selected.append(frame)
-            if len(selected) >= limit:
-                break
-        return selected
+        return selected or [valid[len(valid) // 2]]
 
     def _select_representative_frame(self, frames: Sequence[Path]) -> Path:
-        valid = [Path(frame) for frame in frames if Path(frame).exists()]
-        if not valid:
-            raise GeminiSceneAIError("Nenhum frame válido encontrado.")
-        return valid[len(valid) // 2]
+        # Compatibilidade com chamadas antigas.
+        return self._select_representative_frames(frames, limit=1)[0]
 
     def _encode_image(self, path: Path) -> str:
         try:

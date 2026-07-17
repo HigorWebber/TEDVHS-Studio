@@ -30,6 +30,7 @@ from infrastructure.media.scene_detector import SceneDetector
 from presentation.views.media_library_view import MediaLibraryView
 from presentation.views.scene_detection_view import SceneDetectionView
 from presentation.views.clip_library_view import ClipLibraryView
+from presentation.views.montage_editor_view import MontageEditorView
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class MainWindow(QMainWindow):
         self.scene_detector: Optional[SceneDetector] = None
         self.scene_detection_view: Optional[SceneDetectionView] = None
         self.clip_library_view: Optional[ClipLibraryView] = None
+        self.montage_editor_view: Optional[MontageEditorView] = None
         
         # Inicializar controller
         self.controller = MainController(DatabaseConnection())
@@ -70,8 +72,8 @@ class MainWindow(QMainWindow):
         self._setup_status_bar()
         
         # Aplicar configurações da janela
-        self.setWindowTitle("TEDVHS Studio - Biblioteca e Detecção de Cenas")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("TEDVHS Studio - Biblioteca, IA e Editor em Camadas")
+        self.setGeometry(100, 100, 1360, 860)
         
         logger.info("Janela principal inicializada com sucesso")
     
@@ -162,6 +164,15 @@ class MainWindow(QMainWindow):
         )
         self.tabs.addTab(self.clip_library_view, "🎞️ Biblioteca de Clipes")
 
+        # Aba: Montagem / Editor em Camadas
+        self.montage_editor_view = MontageEditorView(
+            self.repository,
+            parent=self,
+        )
+        self.tabs.addTab(self.montage_editor_view, "🧩 Montagem / Editor")
+        self.clip_library_view.send_to_montage_requested.connect(self._open_clip_in_montage)
+        self.montage_editor_view.final_video_exported.connect(self._on_final_video_exported)
+
         self.tabs.currentChanged.connect(self._on_tab_changed)
         
         # Aba: Configurações (placeholder)
@@ -176,13 +187,40 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, index: int) -> None:
         """Ações ao trocar de aba."""
         try:
-            if self.scene_detection_view and self.tabs.widget(index) is not self.scene_detection_view:
+            current = self.tabs.widget(index)
+            if self.scene_detection_view and current is not self.scene_detection_view:
                 if hasattr(self.scene_detection_view, "player"):
                     self.scene_detection_view.player.pause()
-            if self.clip_library_view and self.tabs.widget(index) is self.clip_library_view:
+            if self.clip_library_view and current is not self.clip_library_view:
+                if hasattr(self.clip_library_view, "_stop_preview"):
+                    self.clip_library_view._stop_preview(clear_source=False)
+            if self.montage_editor_view and current is not self.montage_editor_view:
+                self.montage_editor_view.pause_players()
+            if self.clip_library_view and current is self.clip_library_view:
                 self.clip_library_view.refresh_clips()
         except Exception as exc:
             logger.warning("Erro ao processar troca de aba: %s", exc)
+
+    def _open_clip_in_montage(self, clip: object) -> None:
+        """Abrir clipe selecionado na aba de montagem."""
+        try:
+            if not self.montage_editor_view:
+                return
+            self.montage_editor_view.load_clip(dict(clip or {}))
+            index = self.tabs.indexOf(self.montage_editor_view)
+            if index >= 0:
+                self.tabs.setCurrentIndex(index)
+            self.status_label.setText("Clipe enviado para Montagem / Editor")
+        except Exception as exc:
+            QMessageBox.warning(self, "Montagem", f"Não foi possível abrir o clipe na montagem:\n{exc}")
+
+    def _on_final_video_exported(self, payload: object) -> None:
+        """Atualizar biblioteca quando o editor exportar um vídeo final."""
+        try:
+            if self.clip_library_view:
+                self.clip_library_view.refresh_clips()
+        except Exception as exc:
+            logger.warning("Não foi possível atualizar biblioteca depois do vídeo final: %s", exc)
 
     def _setup_menu(self) -> None:
         """Configurar menu bar."""
