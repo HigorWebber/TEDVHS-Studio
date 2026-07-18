@@ -460,26 +460,40 @@ class HybridSubtitleService:
         raise SubtitleGenerationError(f"A Gemini API não retornou uma lista de traduções. Resposta: {text[:900]}")
 
     def _parse_srt(self, text: str) -> List[SrtCue]:
-        cleaned = re.sub(r"^```(?:srt)?\s*", "", text.strip(), flags=re.IGNORECASE)
+        """Parser SRT/VTT robusto.
+
+        A versão anterior separava cues por linhas em branco. Alguns arquivos
+        extraídos/traduzidos vêm sem a linha em branco correta; nesse caso o
+        parser colocava números e timestamps dentro do texto da legenda. Agora
+        a leitura é feita por cada linha de tempo encontrada, então os horários
+        nunca viram texto na tela.
+        """
+        cleaned = re.sub(r"^```(?:srt|vtt)?\s*", "", str(text or "").strip(), flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned)
         cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
-        blocks = re.split(r"\n\s*\n+", cleaned)
+        time_re = re.compile(
+            r"(?P<start>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(?P<end>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})(?:[^\n]*)"
+        )
+        matches = list(time_re.finditer(cleaned))
         cues: List[SrtCue] = []
-        time_re = re.compile(r"(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})")
-        for block in blocks:
-            lines = [line.strip("\ufeff ") for line in block.split("\n") if line.strip()]
-            if not lines:
-                continue
-            time_line_index = next((idx for idx, line in enumerate(lines) if time_re.search(line)), -1)
-            if time_line_index < 0:
-                continue
-            match = time_re.search(lines[time_line_index])
-            if not match:
-                continue
-            start = self._parse_srt_time(match.group(1))
-            end = self._parse_srt_time(match.group(2))
-            cue_text = "\n".join(lines[time_line_index + 1 :]).strip()
-            cue_text = self._clean_subtitle_text(cue_text)
+        for index, match in enumerate(matches):
+            start = self._parse_srt_time(match.group("start"))
+            end = self._parse_srt_time(match.group("end"))
+            text_start = match.end()
+            text_end = matches[index + 1].start() if index + 1 < len(matches) else len(cleaned)
+            block = cleaned[text_start:text_end]
+            lines: List[str] = []
+            for line in block.split("\n"):
+                value = line.strip("\ufeff \t")
+                if not value:
+                    continue
+                if re.fullmatch(r"\d+", value):
+                    continue
+                if time_re.search(value):
+                    continue
+                lines.append(value)
+            cue_text = self._clean_subtitle_text("\n".join(lines))
+            cue_text = re.sub(r"(?m)^\s*\d+\s*$", "", cue_text).strip()
             if cue_text and end > start:
                 cues.append(SrtCue(start=start, end=end, text=cue_text))
         return self._merge_and_clean_cues(cues)
@@ -504,7 +518,7 @@ PlayResY: 1080
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: AnimePTBR,Arial,52,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,-1,0,0,0,100,100,0,0,1,3,1,2,90,90,70,1
+Style: AnimePTBR,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,-1,0,0,0,100,100,0,0,1,3,1,2,90,90,64,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text

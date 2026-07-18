@@ -70,7 +70,10 @@ class GeminiNarrationService:
         subtitle_text = str(context.get("subtitle_text") or "").strip()
         style = str(context.get("style") or "Empolgado").strip()
         length = str(context.get("length") or "Acompanhar clipe inteiro").strip()
+        engagement_mode = bool(context.get("engagement_mode") or context.get("retention_mode") or context.get("for_you_mode"))
+        engagement_goal = str(context.get("engagement_goal") or "").strip()
         duration_instruction = self._duration_instruction(length, duration_seconds)
+        engagement_instruction = self._engagement_instruction(engagement_mode, engagement_goal)
 
         if not description:
             description = "Sem descrição detalhada salva. Use as demais informações sem inventar demais."
@@ -92,6 +95,8 @@ Contexto do clipe:
 - Estilo desejado: {style}
 - Tamanho/duração desejada da narração: {length}
 - Instrução de duração: {duration_instruction}
+- Modo retenção/For You: {"ativado" if engagement_mode else "desativado"}
+- Instrução de engajamento: {engagement_instruction}
 
 Descrição já gerada do clipe:
 {description[:3500]}
@@ -106,6 +111,12 @@ Regras importantes:
 - A duração solicitada se refere à NARRAÇÃO em áudio, não à legenda do anime.
 - Se a instrução pedir para acompanhar o clipe inteiro, não faça só uma introdução curta; crie falas suficientes para chegar perto do final do vídeo.
 - Use uma abertura forte nos primeiros segundos.
+- Se o modo retenção/For You estiver ativado, os primeiros 3 segundos devem ser uma frase curta de parada de scroll.
+- Se o modo retenção/For You estiver ativado, não comece com “nesse vídeo”, “hoje eu vou” ou introduções lentas. Comece direto com curiosidade, tensão, pergunta forte ou promessa coerente.
+- Se o modo retenção/For You estiver ativado, crie progressão: gancho imediato → explicação com ritmo → virada/valor → fechamento que incentive comentar/salvar/seguir sem parecer forçado.
+- O fechamento deve parecer natural, como parte do vídeo, não propaganda seca.
+- Evite clickbait mentiroso: seja chamativo, mas coerente com o clipe.
+- Prefira frases curtas, fortes e fáceis para TTS narrar bem.
 - Não use linguagem robótica.
 - Não coloque mais de 5 hashtags.
 - Não use markdown.
@@ -114,7 +125,9 @@ Regras importantes:
 Formato obrigatório:
 {{
   "gancho": "frase inicial forte para prender atenção",
+  "abertura_for_you": "primeira frase/primeiros 3 segundos para fazer a pessoa parar no feed",
   "roteiro_narracao": "texto completo para o narrador ler, no tamanho solicitado",
+  "fechamento_retencao": "fechamento curto que segura até o final e chama para comentar/salvar/seguir",
   "resumo_apresentacao": "resumo curto do anime/clipe em 1 ou 2 frases",
   "titulo_tiktok": "título curto e chamativo",
   "texto_tiktok": "texto pronto para publicação, com chamada para comentar/salvar/seguir quando fizer sentido",
@@ -122,6 +135,20 @@ Formato obrigatório:
   "cta": "chamada final curta para o vídeo"
 }}
 """.strip()
+
+    def _engagement_instruction(self, engagement_mode: bool, engagement_goal: str = "") -> str:
+        if not engagement_mode:
+            return "Normal: bom ritmo, mas sem exigir estrutura agressiva de retenção."
+        base = (
+            "Modo retenção/For You ativado. A narração precisa prender nos 3 primeiros segundos com uma frase curta e forte, "
+            "sem introdução lenta. Use gancho imediato, curiosidade clara e ritmo de TikTok/Reels/Shorts. "
+            "O meio deve manter a pessoa assistindo com progressão, não só descrição seca da cena. "
+            "O final deve fechar com valor e CTA natural para comentar, salvar ou seguir, sem parecer propaganda forçada. "
+            "Use frases curtas, palavras simples, tensão narrativa e linguagem humana."
+        )
+        if engagement_goal:
+            base += f" Pedido específico do usuário: {engagement_goal[:600]}"
+        return base
 
     def _duration_instruction(self, length: str, duration_seconds: float) -> str:
         text = str(length or "").lower()
@@ -233,6 +260,8 @@ Formato obrigatório:
             "titulo_tiktok": "Esse anime merece atenção",
             "texto_tiktok": "Você assistiria esse anime? Comenta aí e salva para ver depois.",
             "hashtags": ["#anime", "#otaku", "#animes", "#tedvhs", "#recomendacao"],
+            "abertura_for_you": "Espera até você ver o que acontece nessa cena.",
+            "fechamento_retencao": "Salva esse vídeo e segue o TEDVHS para mais recomendações de anime.",
             "cta": "Segue o TEDVHS para mais recomendações de anime.",
         }
 
@@ -259,7 +288,9 @@ Formato obrigatório:
 
         normalized = dict(result)
         normalized["gancho"] = str(result.get("gancho") or "").strip()
+        normalized["abertura_for_you"] = str(result.get("abertura_for_you") or result.get("abertura") or "").strip()
         normalized["roteiro_narracao"] = str(result.get("roteiro_narracao") or result.get("roteiro") or "").strip()
+        normalized["fechamento_retencao"] = str(result.get("fechamento_retencao") or result.get("fechamento") or "").strip()
         normalized["resumo_apresentacao"] = str(result.get("resumo_apresentacao") or "").strip()
         normalized["titulo_tiktok"] = str(result.get("titulo_tiktok") or result.get("titulo") or "").strip()
         normalized["texto_tiktok"] = str(result.get("texto_tiktok") or result.get("texto_publicacao") or "").strip()

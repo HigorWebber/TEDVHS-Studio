@@ -349,6 +349,8 @@ class _ClipNarrationWorker(QObject):
         model: str,
         style: str,
         length: str,
+        engagement_mode: bool = False,
+        engagement_goal: str = "",
     ):
         super().__init__()
         self.narration_service = narration_service
@@ -357,6 +359,8 @@ class _ClipNarrationWorker(QObject):
         self.model = str(model or DEFAULT_NARRATION_MODEL).strip() or DEFAULT_NARRATION_MODEL
         self.style = str(style or "Empolgado").strip() or "Empolgado"
         self.length = str(length or "Médio").strip() or "Médio"
+        self.engagement_mode = bool(engagement_mode)
+        self.engagement_goal = str(engagement_goal or "").strip()
 
     def run(self) -> None:
         try:
@@ -365,6 +369,8 @@ class _ClipNarrationWorker(QObject):
             context = self._build_context(self.clip)
             context["style"] = self.style
             context["length"] = self.length
+            context["engagement_mode"] = self.engagement_mode
+            context["engagement_goal"] = self.engagement_goal
             result = self.narration_service.generate_clip_narration(
                 context=context,
                 api_key=self.api_key,
@@ -376,6 +382,8 @@ class _ClipNarrationWorker(QObject):
                 "model": self.model,
                 "style": self.style,
                 "length": self.length,
+                "engagement_mode": self.engagement_mode,
+                "engagement_goal": self.engagement_goal,
                 "target_seconds": context.get("duration_seconds"),
                 "result": result,
             })

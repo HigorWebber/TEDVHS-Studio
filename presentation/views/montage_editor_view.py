@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSizePolicy,
     QTextEdit,
+    QFileDialog,
     QVBoxLayout,
     QWidget,
 )
@@ -139,6 +140,8 @@ class MontageEditorView(QWidget):
         self._preview_path: Optional[Path] = None
         self._preview_dirty: bool = True
         self._loading_clip: bool = False
+        self._extra_caption_rows: List[Dict[str, Any]] = []
+        self._watermark_logo_path: str = ""
         self._setup_ui()
 
     # ------------------------------------------------------------------
@@ -256,7 +259,7 @@ class MontageEditorView(QWidget):
         clip_layout.addWidget(self.clear_montage_btn)
         right_layout.addWidget(clip_group)
 
-        layer_group = QGroupBox("Camadas")
+        layer_group = QGroupBox("Camadas ativas / visual da timeline")
         layer_layout = QVBoxLayout(layer_group)
         layer_layout.setSpacing(8)
 
@@ -280,39 +283,36 @@ class MontageEditorView(QWidget):
         self.anime_subtitle_check = QCheckBox("Legenda do anime PT-BR")
         self.anime_subtitle_check.setChecked(True)
         self.anime_subtitle_check.toggled.connect(self._update_tracks)
-        layer_layout.addWidget(self.anime_subtitle_check)
         self.anime_subtitle_status = QLabel("Legenda do anime: aguardando clipe.")
         self.anime_subtitle_status.setWordWrap(True)
         self.anime_subtitle_status.setStyleSheet("color: #a7b2c2;")
-        layer_layout.addWidget(self.anime_subtitle_status)
         anime_position = QHBoxLayout()
         anime_position.addWidget(QLabel("Posição anime:"))
         self.anime_subtitle_position_combo = QComboBox()
         self.anime_subtitle_position_combo.addItems(["inferior", "centro-baixo", "superior"])
         self.anime_subtitle_position_combo.currentTextChanged.connect(lambda _=None: self._update_tracks())
         anime_position.addWidget(self.anime_subtitle_position_combo, 1)
-        layer_layout.addLayout(anime_position)
 
         self.narrator_subtitle_check = QCheckBox("Legenda do narrador")
         self.narrator_subtitle_check.setChecked(True)
         self.narrator_subtitle_check.toggled.connect(self._update_tracks)
-        layer_layout.addWidget(self.narrator_subtitle_check)
         narrator_position = QHBoxLayout()
         narrator_position.addWidget(QLabel("Posição narrador:"))
         self.narrator_subtitle_position_combo = QComboBox()
         self.narrator_subtitle_position_combo.addItems(["superior", "centro", "inferior"])
         self.narrator_subtitle_position_combo.currentTextChanged.connect(lambda _=None: self._update_tracks())
         narrator_position.addWidget(self.narrator_subtitle_position_combo, 1)
-        layer_layout.addLayout(narrator_position)
+        self.dynamic_narrator_subtitle_check = QCheckBox("Narração dinâmica: destacar a palavra falada")
+        self.dynamic_narrator_subtitle_check.setChecked(True)
+        self.dynamic_narrator_subtitle_check.setToolTip("Liga/desliga a legenda dinâmica da narração. Ligado: exige sync do áudio e destaca a palavra falada. Desligado: usa legenda estável por frases.")
+        self.dynamic_narrator_subtitle_check.toggled.connect(self._update_tracks)
 
         self.narration_audio_check = QCheckBox("Áudio da narração")
         self.narration_audio_check.setChecked(True)
         self.narration_audio_check.toggled.connect(self._update_tracks)
-        layer_layout.addWidget(self.narration_audio_check)
         self.narration_audio_status = QLabel("Áudio da narração: aguardando clipe.")
         self.narration_audio_status.setWordWrap(True)
         self.narration_audio_status.setStyleSheet("color: #a7b2c2;")
-        layer_layout.addWidget(self.narration_audio_status)
         narration_volume_row = QHBoxLayout()
         narration_volume_row.addWidget(QLabel("Volume narração:"))
         self.narration_volume_spin = QDoubleSpinBox()
@@ -322,32 +322,53 @@ class MontageEditorView(QWidget):
         self.narration_volume_spin.setSuffix("x")
         self.narration_volume_spin.valueChanged.connect(lambda _=None: self._update_tracks())
         narration_volume_row.addWidget(self.narration_volume_spin, 1)
-        layer_layout.addLayout(narration_volume_row)
 
-        self.extra_text_check = QCheckBox("Texto extra na tela")
+        self.extra_text_check = QCheckBox("Legendas extras na tela")
         self.extra_text_check.setChecked(False)
         self.extra_text_check.toggled.connect(self._update_tracks)
         layer_layout.addWidget(self.extra_text_check)
-        self.extra_text_edit = QLineEdit()
-        self.extra_text_edit.setPlaceholderText("Ex.: VOCÊ ASSISTIRIA? / SALVA PRA VER DEPOIS")
-        self.extra_text_edit.textChanged.connect(lambda _=None: self._update_tracks())
-        layer_layout.addWidget(self.extra_text_edit)
-        extra_position = QHBoxLayout()
-        extra_position.addWidget(QLabel("Posição texto:"))
-        self.extra_text_position_combo = QComboBox()
-        self.extra_text_position_combo.addItems(["centro", "superior", "inferior"])
-        self.extra_text_position_combo.currentTextChanged.connect(lambda _=None: self._update_tracks())
-        extra_position.addWidget(self.extra_text_position_combo, 1)
-        layer_layout.addLayout(extra_position)
+        self.extra_text_status = QLabel("Nenhuma legenda extra adicionada.")
+        self.extra_text_status.setWordWrap(True)
+        self.extra_text_status.setStyleSheet("color: #a7b2c2;")
+        layer_layout.addWidget(self.extra_text_status)
 
         self.watermark_check = QCheckBox("Marca d'água TEDVHS")
         self.watermark_check.setChecked(True)
         self.watermark_check.toggled.connect(self._update_tracks)
         layer_layout.addWidget(self.watermark_check)
         self.watermark_text_edit = QLineEdit("@tedvhs")
-        self.watermark_text_edit.setPlaceholderText("Ex.: @tedvhs")
+        self.watermark_text_edit.setPlaceholderText("Ex.: @tedvhs. Deixe vazio se quiser usar só a logo.")
         self.watermark_text_edit.textChanged.connect(lambda _=None: self._update_tracks())
         layer_layout.addWidget(self.watermark_text_edit)
+        logo_row = QHBoxLayout()
+        self.watermark_logo_label = QLabel("Logo: nenhuma")
+        self.watermark_logo_label.setWordWrap(True)
+        self.watermark_logo_label.setStyleSheet("color: #a7b2c2;")
+        logo_row.addWidget(self.watermark_logo_label, 1)
+        self.select_watermark_logo_btn = QPushButton("Selecionar logo")
+        self.select_watermark_logo_btn.clicked.connect(self._select_watermark_logo)
+        logo_row.addWidget(self.select_watermark_logo_btn)
+        self.clear_watermark_logo_btn = QPushButton("Limpar logo")
+        self.clear_watermark_logo_btn.clicked.connect(self._clear_watermark_logo)
+        logo_row.addWidget(self.clear_watermark_logo_btn)
+        layer_layout.addLayout(logo_row)
+        logo_size_row = QHBoxLayout()
+        logo_size_row.addWidget(QLabel("Tamanho logo:"))
+        self.watermark_logo_size_spin = QDoubleSpinBox()
+        self.watermark_logo_size_spin.setRange(3.0, 40.0)
+        self.watermark_logo_size_spin.setSingleStep(1.0)
+        self.watermark_logo_size_spin.setValue(14.0)
+        self.watermark_logo_size_spin.setSuffix("%")
+        self.watermark_logo_size_spin.valueChanged.connect(lambda _=None: self._update_tracks())
+        logo_size_row.addWidget(self.watermark_logo_size_spin, 1)
+        logo_size_row.addWidget(QLabel("Opacidade:"))
+        self.watermark_logo_opacity_spin = QDoubleSpinBox()
+        self.watermark_logo_opacity_spin.setRange(0.10, 1.0)
+        self.watermark_logo_opacity_spin.setSingleStep(0.05)
+        self.watermark_logo_opacity_spin.setValue(0.78)
+        self.watermark_logo_opacity_spin.valueChanged.connect(lambda _=None: self._update_tracks())
+        logo_size_row.addWidget(self.watermark_logo_opacity_spin, 1)
+        layer_layout.addLayout(logo_size_row)
         watermark_position = QHBoxLayout()
         watermark_position.addWidget(QLabel("Posição marca:"))
         self.watermark_position_combo = QComboBox()
@@ -357,6 +378,29 @@ class MontageEditorView(QWidget):
         layer_layout.addLayout(watermark_position)
 
         right_layout.addWidget(layer_group)
+
+        extra_group = QGroupBox("Legendas extras cronometradas")
+        extra_layout = QVBoxLayout(extra_group)
+        extra_help = QLabel(
+            "Adicione textos que aparecem em trechos específicos do vídeo. Ex.: ‘assista até o final’ de 00:00:00 até 00:00:15."
+        )
+        extra_help.setWordWrap(True)
+        extra_help.setStyleSheet("color: #a7b2c2;")
+        extra_layout.addWidget(extra_help)
+        self.extra_captions_container = QWidget()
+        self.extra_captions_layout = QVBoxLayout(self.extra_captions_container)
+        self.extra_captions_layout.setContentsMargins(0, 0, 0, 0)
+        self.extra_captions_layout.setSpacing(8)
+        extra_layout.addWidget(self.extra_captions_container)
+        extra_actions = QHBoxLayout()
+        self.add_extra_caption_btn = QPushButton("Adicionar legenda extra")
+        self.add_extra_caption_btn.clicked.connect(self._add_extra_caption_row)
+        extra_actions.addWidget(self.add_extra_caption_btn, 1)
+        self.clear_extra_captions_btn = QPushButton("Limpar extras")
+        self.clear_extra_captions_btn.clicked.connect(self._clear_extra_caption_rows)
+        extra_actions.addWidget(self.clear_extra_captions_btn, 1)
+        extra_layout.addLayout(extra_actions)
+        right_layout.addWidget(extra_group)
 
         api_group = QGroupBox("IA e complementos da montagem")
         api_layout = QVBoxLayout(api_group)
@@ -404,6 +448,9 @@ class MontageEditorView(QWidget):
 
         subtitle_group = QGroupBox("Legenda do anime PT-BR")
         subtitle_layout = QVBoxLayout(subtitle_group)
+        subtitle_layout.addWidget(self.anime_subtitle_check)
+        subtitle_layout.addWidget(self.anime_subtitle_status)
+        subtitle_layout.addLayout(anime_position)
         self.subtitle_status_label = QLabel("Envie um clipe para a montagem para ver o status da legenda.")
         self.subtitle_status_label.setWordWrap(True)
         self.subtitle_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -418,7 +465,7 @@ class MontageEditorView(QWidget):
         subtitle_layout.addLayout(subtitle_actions)
         right_layout.addWidget(subtitle_group)
 
-        narrator_group = QGroupBox("Roteiro, narração e legenda do narrador")
+        narrator_group = QGroupBox("Roteiro, narração, legenda da narração e post")
         narrator_layout = QVBoxLayout(narrator_group)
         narration_help = QLabel(
             "Aqui você prepara tudo que complementa o vídeo base: roteiro, blocos de fala, áudio da narração, legenda do narrador e texto do post."
@@ -450,6 +497,20 @@ class MontageEditorView(QWidget):
         ])
         narration_options.addWidget(self.narration_length_combo, 1)
         narrator_layout.addLayout(narration_options)
+
+        retention_row = QHBoxLayout()
+        self.narration_retention_check = QCheckBox("Modo For You: gancho forte + final engajante")
+        self.narration_retention_check.setChecked(True)
+        self.narration_retention_check.setToolTip(
+            "Pede para a IA criar uma narração com abertura forte para parar o feed e fechamento que incentive comentar, salvar ou seguir."
+        )
+        self.narration_retention_check.stateChanged.connect(lambda _=None: self._mark_preview_dirty("modo For You da narração alterado"))
+        retention_row.addWidget(self.narration_retention_check, 1)
+        self.narration_retention_goal_edit = QLineEdit()
+        self.narration_retention_goal_edit.setPlaceholderText("Pedido extra opcional. Ex.: prender nos 3 primeiros segundos e fechar com CTA natural")
+        self.narration_retention_goal_edit.textChanged.connect(lambda _=None: self._mark_preview_dirty("direção de engajamento alterada"))
+        retention_row.addWidget(self.narration_retention_goal_edit, 2)
+        narrator_layout.addLayout(retention_row)
 
         narrator_layout.addWidget(QLabel("Roteiro para narrador:"))
         self.narrator_script_edit = QTextEdit()
@@ -518,8 +579,11 @@ class MontageEditorView(QWidget):
         narration_copy_actions.addWidget(self.copy_narration_btn, 1)
         narrator_layout.addLayout(narration_copy_actions)
 
-        audio_group = QGroupBox("Áudio da narração")
+        audio_group = QGroupBox("Narração")
         audio_layout = QVBoxLayout(audio_group)
+        audio_layout.addWidget(self.narration_audio_check)
+        audio_layout.addWidget(self.narration_audio_status)
+        audio_layout.addLayout(narration_volume_row)
         self.narration_audio_status_label = QLabel("Status: sem áudio de narração para esta montagem.")
         self.narration_audio_status_label.setWordWrap(True)
         self.narration_audio_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -547,23 +611,33 @@ class MontageEditorView(QWidget):
         audio_layout.addLayout(audio_actions)
         narrator_layout.addWidget(audio_group)
 
+        narrator_subtitle_group = QGroupBox("Legenda da narração")
+        narrator_subtitle_layout = QVBoxLayout(narrator_subtitle_group)
+        narrator_subtitle_layout.addWidget(self.narrator_subtitle_check)
+        narrator_subtitle_layout.addLayout(narrator_position)
+        narrator_subtitle_layout.addWidget(self.dynamic_narrator_subtitle_check)
+        dynamic_help = QLabel("Com Narração dinâmica ligada, a legenda da narração fica em um único bloco; só a palavra atual deve ficar destacada. Não mexe na legenda do anime.")
+        dynamic_help.setWordWrap(True)
+        dynamic_help.setStyleSheet("color: #a7b2c2;")
+        narrator_subtitle_layout.addWidget(dynamic_help)
         duration_row = QHBoxLayout()
         duration_row.addWidget(QLabel("Legenda narrador cobre:"))
         self.narrator_subtitle_duration_combo = QComboBox()
-        self.narrator_subtitle_duration_combo.addItems(["vídeo inteiro", "duração da narração"])
-        self.narrator_subtitle_duration_combo.setToolTip("Isto controla só a legenda visual do narrador. A duração da narração em áudio é definida pelo roteiro/MP3 gerado aqui na Montagem.")
+        self.narrator_subtitle_duration_combo.addItems(["seguir áudio da narração", "vídeo inteiro", "duração da narração"])
+        self.narrator_subtitle_duration_combo.setToolTip("Isto controla a duração visual da legenda do narrador. Para destaque palavra por palavra, o ideal é seguir o áudio da narração.")
         self.narrator_subtitle_duration_combo.currentTextChanged.connect(lambda _=None: self._update_tracks())
         duration_row.addWidget(self.narrator_subtitle_duration_combo, 1)
-        narrator_layout.addLayout(duration_row)
+        narrator_subtitle_layout.addLayout(duration_row)
         gen_row = QHBoxLayout()
-        self.generate_narrator_sub_btn = QPushButton("Gerar legenda do narrador")
+        self.generate_narrator_sub_btn = QPushButton("Gerar legenda da narração")
         self.generate_narrator_sub_btn.clicked.connect(self._generate_narrator_subtitle_only)
         gen_row.addWidget(self.generate_narrator_sub_btn, 1)
-        narrator_layout.addLayout(gen_row)
-        self.narrator_subtitle_status = QLabel("Legenda do narrador será gerada automaticamente na exportação.")
+        narrator_subtitle_layout.addLayout(gen_row)
+        self.narrator_subtitle_status = QLabel("Legenda da narração será gerada automaticamente na prévia/exportação.")
         self.narrator_subtitle_status.setWordWrap(True)
         self.narrator_subtitle_status.setStyleSheet("color: #a7b2c2;")
-        narrator_layout.addWidget(self.narrator_subtitle_status)
+        narrator_subtitle_layout.addWidget(self.narrator_subtitle_status)
+        narrator_layout.addWidget(narrator_subtitle_group)
         right_layout.addWidget(narrator_group)
 
         export_group = QGroupBox("Exportação final")
@@ -793,6 +867,187 @@ class MontageEditorView(QWidget):
         self.play_btn.setText("⏸ Pause" if state == QMediaPlayer.PlayingState else "▶ Play")
 
     # ------------------------------------------------------------------
+    # Legendas extras / marca d'água
+    # ------------------------------------------------------------------
+    def _add_extra_caption_row(
+        self,
+        text: str = "",
+        start_time: str = "",
+        end_time: str = "",
+        position: str = "centro",
+    ) -> None:
+        duration = self._clip_duration(self._clip or {}) if self._clip else 0.0
+        if not start_time:
+            if self._extra_caption_rows:
+                last_end = self._time_to_seconds(self._extra_caption_rows[-1]["end_edit"].text())
+                start_seconds = last_end
+            else:
+                start_seconds = 0.0
+            start_time = self._format_timecode(start_seconds)
+        else:
+            start_seconds = self._time_to_seconds(start_time)
+        if not end_time:
+            end_seconds = start_seconds + 15.0
+            if duration > 0:
+                end_seconds = min(duration, end_seconds)
+            end_time = self._format_timecode(end_seconds)
+
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setStyleSheet("QFrame { border: 1px solid #303b4d; border-radius: 6px; padding: 4px; }")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
+
+        header = QHBoxLayout()
+        title = QLabel("Legenda extra")
+        title.setStyleSheet("font-weight: 700; color: #dce7f5;")
+        header.addWidget(title, 1)
+        remove_btn = QPushButton("Remover")
+        header.addWidget(remove_btn)
+        layout.addLayout(header)
+
+        text_edit = QLineEdit(str(text or ""))
+        text_edit.setPlaceholderText("Ex.: assista até o final")
+        layout.addWidget(text_edit)
+
+        time_row = QHBoxLayout()
+        time_row.addWidget(QLabel("Início:"))
+        start_edit = QLineEdit(str(start_time or "00:00:00"))
+        start_edit.setPlaceholderText("00:00:00")
+        time_row.addWidget(start_edit, 1)
+        time_row.addWidget(QLabel("Fim:"))
+        end_edit = QLineEdit(str(end_time or "00:00:15"))
+        end_edit.setPlaceholderText("00:00:15")
+        time_row.addWidget(end_edit, 1)
+        layout.addLayout(time_row)
+
+        position_row = QHBoxLayout()
+        position_row.addWidget(QLabel("Posição:"))
+        position_combo = QComboBox()
+        position_combo.addItems(["centro", "superior", "inferior"])
+        self._set_combo_text(position_combo, str(position or "centro"))
+        position_row.addWidget(position_combo, 1)
+        layout.addLayout(position_row)
+
+        row = {
+            "frame": frame,
+            "title": title,
+            "text_edit": text_edit,
+            "start_edit": start_edit,
+            "end_edit": end_edit,
+            "position_combo": position_combo,
+            "remove_btn": remove_btn,
+        }
+        remove_btn.clicked.connect(lambda _=None, item=row: self._remove_extra_caption_row(item))
+        text_edit.textChanged.connect(lambda _=None: self._update_tracks())
+        start_edit.textChanged.connect(lambda _=None: self._update_tracks())
+        end_edit.textChanged.connect(lambda _=None: self._update_tracks())
+        position_combo.currentTextChanged.connect(lambda _=None: self._update_tracks())
+
+        self._extra_caption_rows.append(row)
+        self.extra_captions_layout.addWidget(frame)
+        self.extra_text_check.setChecked(True)
+        self._refresh_extra_caption_numbers()
+        self._update_tracks()
+        self._mark_preview_dirty("legenda extra adicionada")
+
+    def _remove_extra_caption_row(self, row: Dict[str, Any]) -> None:
+        if row in self._extra_caption_rows:
+            self._extra_caption_rows.remove(row)
+        frame = row.get("frame")
+        if frame is not None:
+            frame.setParent(None)
+            frame.deleteLater()
+        self._refresh_extra_caption_numbers()
+        self._update_tracks()
+        self._mark_preview_dirty("legenda extra removida")
+
+    def _clear_extra_caption_rows(self) -> None:
+        for row in list(self._extra_caption_rows):
+            frame = row.get("frame")
+            if frame is not None:
+                frame.setParent(None)
+                frame.deleteLater()
+        self._extra_caption_rows.clear()
+        if hasattr(self, "extra_text_check"):
+            self.extra_text_check.setChecked(False)
+        self._refresh_extra_caption_numbers()
+        self._update_tracks()
+        self._mark_preview_dirty("legendas extras limpas")
+
+    def _clear_extra_caption_rows_silent(self) -> None:
+        for row in list(getattr(self, "_extra_caption_rows", [])):
+            frame = row.get("frame")
+            if frame is not None:
+                frame.setParent(None)
+                frame.deleteLater()
+        self._extra_caption_rows.clear()
+        if hasattr(self, "extra_text_check"):
+            self.extra_text_check.setChecked(False)
+        self._refresh_extra_caption_numbers()
+
+    def _refresh_extra_caption_numbers(self) -> None:
+        for index, row in enumerate(self._extra_caption_rows, start=1):
+            title = row.get("title")
+            if title is not None:
+                title.setText(f"Legenda extra {index}")
+        if hasattr(self, "extra_text_status"):
+            count = len(self._current_extra_caption_entries())
+            if count:
+                self.extra_text_status.setText(f"{count} legenda(s) extra(s) adicionada(s) na timeline.")
+            else:
+                self.extra_text_status.setText("Nenhuma legenda extra adicionada.")
+
+    def _current_extra_caption_entries(self) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for row in getattr(self, "_extra_caption_rows", []):
+            text_widget = row.get("text_edit")
+            start_widget = row.get("start_edit")
+            end_widget = row.get("end_edit")
+            position_widget = row.get("position_combo")
+            text = text_widget.text().strip() if text_widget is not None else ""
+            if not text:
+                continue
+            start = self._time_to_seconds(start_widget.text() if start_widget is not None else "0")
+            end = self._time_to_seconds(end_widget.text() if end_widget is not None else "0")
+            if end <= start:
+                end = start + 1.0
+            entries.append({
+                "text": text,
+                "start": start,
+                "end": end,
+                "position": position_widget.currentText() if position_widget is not None else "centro",
+                "start_time": self._format_timecode(start),
+                "end_time": self._format_timecode(end),
+            })
+        return entries
+
+    def _select_watermark_logo(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar logo / marca d'água",
+            "",
+            "Imagens (*.png *.jpg *.jpeg *.webp *.bmp);;Todos os arquivos (*.*)",
+        )
+        if not path:
+            return
+        self._watermark_logo_path = path
+        if hasattr(self, "watermark_logo_label"):
+            self.watermark_logo_label.setText(f"Logo: {path}")
+        if hasattr(self, "watermark_check"):
+            self.watermark_check.setChecked(True)
+        self._update_tracks()
+        self._mark_preview_dirty("logo da marca d'água alterada")
+
+    def _clear_watermark_logo(self) -> None:
+        self._watermark_logo_path = ""
+        if hasattr(self, "watermark_logo_label"):
+            self.watermark_logo_label.setText("Logo: nenhuma")
+        self._update_tracks()
+        self._mark_preview_dirty("logo da marca d'água removida")
+
+    # ------------------------------------------------------------------
     # Legendas / exportação
     # ------------------------------------------------------------------
     def _generate_narrator_subtitle_only(self) -> None:
@@ -829,16 +1084,17 @@ class MontageEditorView(QWidget):
             narrator_ass = self._prepare_narrator_subtitle(clip, output_stem=safe_stem)
 
         extra_ass: Optional[Path] = None
-        if self.extra_text_check.isChecked():
-            extra_ass = self.service.generate_extra_text_ass(
-                self.extra_text_edit.text(),
-                working_dir / f"{safe_stem}.texto_extra.ass",
+        extra_entries = self._current_extra_caption_entries()
+        if self.extra_text_check.isChecked() and extra_entries:
+            extra_ass = self.service.generate_extra_texts_ass(
+                extra_entries,
+                working_dir / f"{safe_stem}.legendas_extras.ass",
                 duration_seconds=duration,
-                position=self.extra_text_position_combo.currentText(),
-                title="Texto extra TEDVHS",
+                title="Legendas extras TEDVHS",
             )
 
         watermark_ass: Optional[Path] = None
+        watermark_logo: Optional[Path] = None
         if hasattr(self, "watermark_check") and self.watermark_check.isChecked():
             watermark_ass = self.service.generate_watermark_ass(
                 self.watermark_text_edit.text(),
@@ -847,6 +1103,11 @@ class MontageEditorView(QWidget):
                 position=self.watermark_position_combo.currentText(),
                 title="Marca d'água TEDVHS",
             )
+            logo_value = str(getattr(self, "_watermark_logo_path", "") or "").strip()
+            if logo_value:
+                candidate = Path(logo_value)
+                if candidate.exists():
+                    watermark_logo = candidate
 
         narration_audio = self._find_narration_audio_path(clip) if self.narration_audio_check.isChecked() else None
         return EditorExportOptions(
@@ -859,6 +1120,10 @@ class MontageEditorView(QWidget):
             narrator_subtitle_path=narrator_ass,
             extra_text_subtitle_path=extra_ass,
             watermark_subtitle_path=watermark_ass,
+            watermark_image_path=watermark_logo,
+            watermark_image_position=self.watermark_position_combo.currentText() if hasattr(self, "watermark_position_combo") else "superior direito",
+            watermark_image_scale_percent=float(self.watermark_logo_size_spin.value()) if hasattr(self, "watermark_logo_size_spin") else 14.0,
+            watermark_image_opacity=float(self.watermark_logo_opacity_spin.value()) if hasattr(self, "watermark_logo_opacity_spin") else 0.78,
             duration_seconds=duration,
         )
 
@@ -896,10 +1161,14 @@ class MontageEditorView(QWidget):
                     "anime_subtitle_path": str(anime_ass) if anime_ass else "",
                     "narrator_subtitle": bool(narrator_ass),
                     "narrator_subtitle_path": str(narrator_ass) if narrator_ass else "",
-                    "extra_text": self.extra_text_edit.text().strip() if self.extra_text_check.isChecked() else "",
+                    "extra_text_items": self._current_extra_caption_entries() if self.extra_text_check.isChecked() else [],
                     "narration_audio": str(narration_audio) if narration_audio else "",
+                    "narration_sync_path": str(self._find_narration_sync_path(clip) or ""),
                     "watermark": self.watermark_text_edit.text().strip() if hasattr(self, "watermark_text_edit") and self.watermark_check.isChecked() else "",
                     "watermark_path": str(watermark_ass) if watermark_ass else "",
+                    "watermark_logo_path": str(getattr(self, "_watermark_logo_path", "") or ""),
+                    "watermark_logo_size_percent": float(self.watermark_logo_size_spin.value()) if hasattr(self, "watermark_logo_size_spin") else 14.0,
+                    "watermark_logo_opacity": float(self.watermark_logo_opacity_spin.value()) if hasattr(self, "watermark_logo_opacity_spin") else 0.78,
                     "original_volume": float(self.original_volume_spin.value()),
                     "narration_volume": float(self.narration_volume_spin.value()),
                     "narrator_subtitle_duration_mode": self.narrator_subtitle_duration_combo.currentText() if hasattr(self, "narrator_subtitle_duration_combo") else "vídeo inteiro",
@@ -953,15 +1222,46 @@ class MontageEditorView(QWidget):
         base_video = Path(str(clip.get("output_path") or ""))
         duration = self._duration_for_narrator_subtitle(clip)
         safe_stem = self._safe_output_stem(output_stem or base_video.stem)
-        output_path = base_video.parent / "_tedvhs_layers" / f"{safe_stem}.narrador.ass"
-        path = self.service.generate_narrator_ass(
-            self.narrator_script_edit.toPlainText().strip(),
+        position = self.narrator_subtitle_position_combo.currentText()
+        dynamic_enabled = bool(
+            getattr(self, "dynamic_narrator_subtitle_check", None)
+            and self.dynamic_narrator_subtitle_check.isChecked()
+        )
+        # Nomes separados evitam o player/FFmpeg reaproveitar uma legenda antiga
+        # gerada em versões anteriores, especialmente no teste da prévia aplicada.
+        suffix = "narrador_dinamico_tiktok_v16" if dynamic_enabled else "narrador_estavel"
+        output_path = base_video.parent / "_tedvhs_layers" / f"{safe_stem}.{suffix}.ass"
+
+        if dynamic_enabled:
+            sync_path = self._find_narration_sync_path(clip)
+            if not sync_path:
+                raise LayeredEditorError(
+                    "Narração dinâmica está ligada, mas não existe sync do áudio.\n\n"
+                    "Faça assim:\n"
+                    "1. Vá no grupo Narração;\n"
+                    "2. Clique em Gerar áudio da narração novamente;\n"
+                    "3. Quando o status mostrar sync dinâmico OK, atualize a prévia.\n\n"
+                    "Ou desmarque Narração dinâmica para usar legenda estável por frases."
+                )
+            path = self.service.generate_narrator_ass_from_sync(
+                self._current_narration_script_text(),
+                sync_path,
+                output_path,
+                duration_seconds=duration,
+                position=position,
+                title="Legenda da narração TEDVHS dinâmica TikTok",
+            )
+            self.narrator_subtitle_status.setText(f"Legenda da narração dinâmica TikTok recriada sem destaque total: {path}")
+            return path
+
+        path = self.service.generate_narrator_stable_blocks_ass(
+            self._current_narration_script_text(),
             output_path,
             duration_seconds=duration,
-            position=self.narrator_subtitle_position_combo.currentText(),
+            position=position,
             title="Legenda do narrador TEDVHS",
         )
-        self.narrator_subtitle_status.setText(f"Legenda do narrador: {path}")
+        self.narrator_subtitle_status.setText(f"Legenda da narração estável: {path}")
         return path
 
 
@@ -996,6 +1296,50 @@ class MontageEditorView(QWidget):
             self._set_combo_text(self.narration_style_combo, str(package.get("estilo") or clip.get("narration_style") or metadata.get("narration_style") or "Empolgado"))
         if hasattr(self, "narration_length_combo"):
             self._set_combo_text(self.narration_length_combo, str(package.get("tamanho") or clip.get("narration_length") or metadata.get("narration_length") or "Acompanhar clipe inteiro"))
+        if hasattr(self, "narration_retention_check"):
+            retention_value = package.get("engagement_mode")
+            if retention_value is None:
+                retention_value = metadata.get("narration_engagement_mode")
+            if retention_value is None:
+                retention_value = True
+            self.narration_retention_check.setChecked(bool(retention_value))
+        if hasattr(self, "narration_retention_goal_edit"):
+            self.narration_retention_goal_edit.setText(str(package.get("engagement_goal") or metadata.get("narration_engagement_goal") or ""))
+        if hasattr(self, "dynamic_narrator_subtitle_check"):
+            dynamic_value = metadata.get("narration_dynamic_enabled")
+            if dynamic_value is None:
+                dynamic_value = True
+            self.dynamic_narrator_subtitle_check.setChecked(bool(dynamic_value))
+        # Carrega legendas extras e marca d'água da montagem, quando existirem no JSON do clipe.
+        extra_items = metadata.get("extra_text_items") or metadata.get("extra_captions") or []
+        self._clear_extra_caption_rows_silent()
+        if isinstance(extra_items, list):
+            for item in extra_items:
+                if not isinstance(item, dict):
+                    continue
+                self._add_extra_caption_row(
+                    text=str(item.get("text") or ""),
+                    start_time=str(item.get("start_time") or self._format_timecode(float(item.get("start") or 0.0))),
+                    end_time=str(item.get("end_time") or self._format_timecode(float(item.get("end") or 15.0))),
+                    position=str(item.get("position") or "centro"),
+                )
+        watermark_text = str(metadata.get("watermark_text") or metadata.get("watermark") or "")
+        if watermark_text and hasattr(self, "watermark_text_edit"):
+            self.watermark_text_edit.setText(watermark_text)
+        logo_path = str(metadata.get("watermark_logo_path") or "")
+        self._watermark_logo_path = logo_path
+        if hasattr(self, "watermark_logo_label"):
+            self.watermark_logo_label.setText(f"Logo: {logo_path}" if logo_path else "Logo: nenhuma")
+        if hasattr(self, "watermark_logo_size_spin") and metadata.get("watermark_logo_size_percent") is not None:
+            try:
+                self.watermark_logo_size_spin.setValue(float(metadata.get("watermark_logo_size_percent")))
+            except Exception:
+                pass
+        if hasattr(self, "watermark_logo_opacity_spin") and metadata.get("watermark_logo_opacity") is not None:
+            try:
+                self.watermark_logo_opacity_spin.setValue(float(metadata.get("watermark_logo_opacity")))
+            except Exception:
+                pass
         audio_data = self._narration_audio_data_for_clip(clip)
         if hasattr(self, "narration_voice_combo"):
             self._set_combo_text(self.narration_voice_combo, str(audio_data.get("voice") or DEFAULT_TTS_VOICE))
@@ -1189,10 +1533,12 @@ class MontageEditorView(QWidget):
                 return
         style = self.narration_style_combo.currentText().strip() if hasattr(self, "narration_style_combo") else "Empolgado"
         length = self.narration_length_combo.currentText().strip() if hasattr(self, "narration_length_combo") else "Acompanhar clipe inteiro"
+        engagement_mode = bool(getattr(self, "narration_retention_check", None) and self.narration_retention_check.isChecked())
+        engagement_goal = self.narration_retention_goal_edit.text().strip() if hasattr(self, "narration_retention_goal_edit") else ""
         self._set_complement_buttons_enabled(False)
         self.status_label.setText("Gerando roteiro de narração da montagem...")
         thread = QThread(self)
-        worker = _ClipNarrationWorker(self.narration_service, clip, api_key, model, style, length)
+        worker = _ClipNarrationWorker(self.narration_service, clip, api_key, model, style, length, engagement_mode=engagement_mode, engagement_goal=engagement_goal)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self.status_label.setText)
@@ -1229,6 +1575,10 @@ class MontageEditorView(QWidget):
                 "modelo": payload.get("model"),
                 "estilo": payload.get("style"),
                 "tamanho": payload.get("length"),
+                "engagement_mode": payload.get("engagement_mode"),
+                "engagement_goal": payload.get("engagement_goal"),
+                "abertura_for_you": result.get("abertura_for_you"),
+                "fechamento_retencao": result.get("fechamento_retencao"),
                 "narration_blocks": blocks,
             })
             self._update_metadata_json(clip, {
@@ -1241,6 +1591,10 @@ class MontageEditorView(QWidget):
                 "hashtags": hashtags_text,
                 "narration_style": payload.get("style"),
                 "narration_length": payload.get("length"),
+                "narration_engagement_mode": payload.get("engagement_mode"),
+                "narration_engagement_goal": payload.get("engagement_goal"),
+                "narration_opening_for_you": result.get("abertura_for_you"),
+                "narration_retention_ending": result.get("fechamento_retencao"),
                 "narration_target_seconds": payload.get("target_seconds"),
                 "narration_model": payload.get("model"),
             })
@@ -1278,6 +1632,8 @@ class MontageEditorView(QWidget):
         hashtags = self.narration_hashtags_edit.text().strip() if hasattr(self, "narration_hashtags_edit") else ""
         style = self.narration_style_combo.currentText().strip() if hasattr(self, "narration_style_combo") else ""
         length = self.narration_length_combo.currentText().strip() if hasattr(self, "narration_length_combo") else ""
+        engagement_mode = bool(getattr(self, "narration_retention_check", None) and self.narration_retention_check.isChecked())
+        engagement_goal = self.narration_retention_goal_edit.text().strip() if hasattr(self, "narration_retention_goal_edit") else ""
         package = {
             "gancho": self._first_sentence(script),
             "roteiro_narracao": script,
@@ -1287,6 +1643,8 @@ class MontageEditorView(QWidget):
             "hashtags": hashtags,
             "estilo": style,
             "tamanho": length,
+            "engagement_mode": engagement_mode,
+            "engagement_goal": engagement_goal,
             "fonte": "montagem",
         }
         self._update_metadata_json(clip, {
@@ -1299,6 +1657,14 @@ class MontageEditorView(QWidget):
             "hashtags": hashtags,
             "narration_style": style,
             "narration_length": length,
+            "narration_engagement_mode": engagement_mode,
+            "narration_engagement_goal": engagement_goal,
+            "extra_text_items": self._current_extra_caption_entries(),
+            "watermark_logo_path": str(getattr(self, "_watermark_logo_path", "") or ""),
+            "watermark_logo_size_percent": float(self.watermark_logo_size_spin.value()) if hasattr(self, "watermark_logo_size_spin") else 14.0,
+            "watermark_logo_opacity": float(self.watermark_logo_opacity_spin.value()) if hasattr(self, "watermark_logo_opacity_spin") else 0.78,
+            "watermark_text": self.watermark_text_edit.text().strip() if hasattr(self, "watermark_text_edit") else "",
+            "narration_dynamic_enabled": bool(getattr(self, "dynamic_narrator_subtitle_check", None) and self.dynamic_narrator_subtitle_check.isChecked()),
         })
 
     def _save_narration_metadata(self) -> None:
@@ -1312,6 +1678,8 @@ class MontageEditorView(QWidget):
         hashtags = self.narration_hashtags_edit.text().strip() if hasattr(self, "narration_hashtags_edit") else ""
         style = self.narration_style_combo.currentText().strip() if hasattr(self, "narration_style_combo") else ""
         length = self.narration_length_combo.currentText().strip() if hasattr(self, "narration_length_combo") else ""
+        engagement_mode = bool(getattr(self, "narration_retention_check", None) and self.narration_retention_check.isChecked())
+        engagement_goal = self.narration_retention_goal_edit.text().strip() if hasattr(self, "narration_retention_goal_edit") else ""
         package = {
             "gancho": self._first_sentence(script),
             "roteiro_narracao": script,
@@ -1321,6 +1689,8 @@ class MontageEditorView(QWidget):
             "hashtags": hashtags,
             "estilo": style,
             "tamanho": length,
+            "engagement_mode": engagement_mode,
+            "engagement_goal": engagement_goal,
             "fonte": "manual_montagem",
         }
         self._update_metadata_json(clip, {
@@ -1333,6 +1703,14 @@ class MontageEditorView(QWidget):
             "hashtags": hashtags,
             "narration_style": style,
             "narration_length": length,
+            "narration_engagement_mode": engagement_mode,
+            "narration_engagement_goal": engagement_goal,
+            "extra_text_items": self._current_extra_caption_entries(),
+            "watermark_logo_path": str(getattr(self, "_watermark_logo_path", "") or ""),
+            "watermark_logo_size_percent": float(self.watermark_logo_size_spin.value()) if hasattr(self, "watermark_logo_size_spin") else 14.0,
+            "watermark_logo_opacity": float(self.watermark_logo_opacity_spin.value()) if hasattr(self, "watermark_logo_opacity_spin") else 0.78,
+            "watermark_text": self.watermark_text_edit.text().strip() if hasattr(self, "watermark_text_edit") else "",
+            "narration_dynamic_enabled": bool(getattr(self, "dynamic_narrator_subtitle_check", None) and self.dynamic_narrator_subtitle_check.isChecked()),
         })
         self._reload_current_clip_metadata()
         self._refresh_complement_statuses(self._clip)
@@ -1476,6 +1854,12 @@ class MontageEditorView(QWidget):
         clip_duration = self._probe_media_duration_seconds(clip_path)
         self._update_metadata_json(clip, {
             "narration_audio_path": payload.get("audio_path"),
+            "narration_sync_path": payload.get("sync_path") or "",
+            "narration_sync_available": bool(payload.get("sync_available")),
+            "narration_sync_word_count": payload.get("sync_word_count") or 0,
+            "narration_sync_source": payload.get("sync_source") or "",
+            "narration_sync_estimated": False,
+            "narration_sync_warning": payload.get("sync_warning") or "",
             "narration_voice": payload.get("voice"),
             "narration_rate": payload.get("rate"),
             "narration_audio_engine": payload.get("engine"),
@@ -1485,6 +1869,17 @@ class MontageEditorView(QWidget):
         self._reload_current_clip_metadata()
         self._refresh_complement_statuses(self._clip)
         message = f"Áudio gerado:\n{payload.get('audio_path')}"
+        if payload.get("sync_available"):
+            source = str(payload.get("sync_source") or "sync")
+            message += f"\n\nSync REAL da legenda dinâmica: OK ({payload.get('sync_word_count') or 0} palavras). Fonte: {source}."
+        else:
+            warning = str(payload.get("sync_warning") or "")
+            message += (
+                "\n\nAtenção: áudio gerado sem sync REAL palavra por palavra."
+                "\nA Narração dinâmica ficará desativada/bloqueada para evitar legenda fora de sincronia."
+            )
+            if warning:
+                message += f"\n\nDetalhe: {warning}"
         if audio_duration > 0 and clip_duration > 0:
             message += f"\n\nDuração do áudio: {self._format_time(audio_duration)} | Duração do clipe: {self._format_time(clip_duration)}"
             if audio_duration < clip_duration * 0.70:
@@ -1569,8 +1964,18 @@ class MontageEditorView(QWidget):
                 if candidate.exists():
                     audio_path = str(candidate)
                     break
+        sync_path = clip.get("narration_sync_path") or metadata.get("narration_sync_path") or ""
+        if not sync_path and audio_path:
+            candidate = Path(str(audio_path)).with_suffix(".sync.json")
+            if candidate.exists():
+                sync_path = str(candidate)
         return {
             "audio_path": str(audio_path or ""),
+            "sync_path": str(sync_path or ""),
+            "sync_available": bool(sync_path and Path(str(sync_path)).exists() and self._is_real_narration_sync(Path(str(sync_path)))),
+            "sync_word_count": metadata.get("narration_sync_word_count") or "",
+            "sync_source": metadata.get("narration_sync_source") or "",
+            "sync_estimated": False,
             "voice": str(clip.get("narration_voice") or metadata.get("narration_voice") or DEFAULT_TTS_VOICE),
             "rate": str(clip.get("narration_rate") or metadata.get("narration_rate") or DEFAULT_TTS_RATE),
             "engine": str(metadata.get("narration_audio_engine") or "edge-tts"),
@@ -1582,8 +1987,19 @@ class MontageEditorView(QWidget):
             return
         data = self._narration_audio_data_for_clip(clip)
         audio_path = Path(str(data.get("audio_path") or ""))
+        sync_path = Path(str(data.get("sync_path") or ""))
         if audio_path.exists():
-            label.setText(f"Status: áudio de narração pronto.\nÁudio: {audio_path}")
+            if sync_path.exists():
+                source = str(data.get("sync_source") or "sync")
+                label.setText(
+                    f"Status: áudio de narração pronto com sync dinâmico REAL OK.\n"
+                    f"Fonte: {source}\nÁudio: {audio_path}\nSync: {sync_path}"
+                )
+            else:
+                label.setText(
+                    f"Status: áudio de narração pronto, mas sem sync palavra por palavra.\n"
+                    f"Áudio: {audio_path}\nGere o áudio novamente após atualizar o edge-tts para tentar criar sync dinâmico real."
+                )
         else:
             label.setText("Status: sem áudio de narração salvo para esta montagem. Gere o áudio após ajustar o roteiro.")
 
@@ -1607,6 +2023,7 @@ class MontageEditorView(QWidget):
             "generate_subtitle_btn", "open_subtitle_btn", "generate_narration_btn", "save_narration_btn",
             "copy_post_btn", "copy_narration_btn", "generate_narration_audio_btn", "play_narration_audio_btn",
             "open_narration_audio_btn", "test_gemini_btn", "save_api_key_btn", "clear_api_key_btn",
+            "add_extra_caption_btn", "clear_extra_captions_btn", "select_watermark_logo_btn", "clear_watermark_logo_btn",
         ):
             button = getattr(self, attr, None)
             if button is not None:
@@ -1819,6 +2236,11 @@ class MontageEditorView(QWidget):
             "subtitle_ass_path": clip.get("subtitle_ass_path") or payload.get("subtitle_ass_path") or "",
             "subtitle_path": clip.get("subtitle_path") or payload.get("subtitle_path") or "",
             "narration_audio_path": str(self._find_narration_audio_path(clip) or payload.get("narration_audio_path") or ""),
+            "extra_text_items": self._current_extra_caption_entries(),
+            "watermark_logo_path": str(getattr(self, "_watermark_logo_path", "") or payload.get("watermark_logo_path") or ""),
+            "watermark_logo_size_percent": float(self.watermark_logo_size_spin.value()) if hasattr(self, "watermark_logo_size_spin") else payload.get("watermark_logo_size_percent", 14.0),
+            "watermark_logo_opacity": float(self.watermark_logo_opacity_spin.value()) if hasattr(self, "watermark_logo_opacity_spin") else payload.get("watermark_logo_opacity", 0.78),
+            "watermark_text": self.watermark_text_edit.text().strip() if hasattr(self, "watermark_text_edit") else payload.get("watermark_text", ""),
             "export_mode": "tedvhs_layered_final",
             "derived_clip": True,
             "derived_type": "final em camadas",
@@ -1906,7 +2328,10 @@ class MontageEditorView(QWidget):
             widget = getattr(self, attr, None)
             if widget is not None:
                 widget.clear()
-        self.extra_text_edit.clear()
+        self._clear_extra_caption_rows_silent()
+        self._watermark_logo_path = ""
+        if hasattr(self, "watermark_logo_label"):
+            self.watermark_logo_label.setText("Logo: nenhuma")
         self.watermark_text_edit.setText("@tedvhs")
         self.anime_subtitle_check.setChecked(False)
         self.narrator_subtitle_check.setChecked(False)
@@ -1932,35 +2357,58 @@ class MontageEditorView(QWidget):
         anime = bool(self.anime_subtitle_check.isChecked())
         narrator_sub = bool(self.narrator_subtitle_check.isChecked())
         narration_audio = bool(self.narration_audio_check.isChecked())
-        extra = bool(self.extra_text_check.isChecked())
+        extra_entries = self._current_extra_caption_entries() if hasattr(self, "_extra_caption_rows") else []
+        extra = bool(self.extra_text_check.isChecked() and extra_entries)
         watermark = bool(getattr(self, "watermark_check", None) and self.watermark_check.isChecked())
+        logo_path = str(getattr(self, "_watermark_logo_path", "") or "").strip()
+        dynamic = bool(getattr(self, "dynamic_narrator_subtitle_check", None) and self.dynamic_narrator_subtitle_check.isChecked())
+
         self._set_track_visible(self.track_video, True, "base")
         self._set_track_visible(self.track_anime_sub, anime, self.anime_subtitle_position_combo.currentText())
-        self._set_track_visible(self.track_narrator_sub, narrator_sub, self.narrator_subtitle_position_combo.currentText())
+        narrator_detail = self.narrator_subtitle_position_combo.currentText()
+        if dynamic:
+            narrator_detail += " • dinâmica REAL OK" if self._clip and self._find_narration_sync_path(self._clip) else " • dinâmica sem sync real"
+        self._set_track_visible(self.track_narrator_sub, narrator_sub, narrator_detail)
         self._set_track_visible(self.track_narration_audio, narration_audio, f"vol {self.narration_volume_spin.value():.2f}x")
-        self._set_track_visible(self.track_extra_text, extra, self.extra_text_position_combo.currentText())
+        if extra_entries:
+            first = extra_entries[0]
+            extra_detail = f"{len(extra_entries)} trecho(s) • {first.get('start_time')}–{first.get('end_time')}"
+        else:
+            extra_detail = "sem trechos"
+        self._set_track_visible(self.track_extra_text, extra, extra_detail)
         if hasattr(self, "track_watermark"):
-            self._set_track_visible(self.track_watermark, watermark, self.watermark_position_combo.currentText() if hasattr(self, "watermark_position_combo") else "")
+            watermark_detail = self.watermark_position_combo.currentText() if hasattr(self, "watermark_position_combo") else ""
+            if logo_path:
+                watermark_detail += " • logo"
+            self._set_track_visible(self.track_watermark, watermark, watermark_detail.strip())
+
+        if hasattr(self, "extra_text_status"):
+            if extra_entries:
+                self.extra_text_status.setText(f"{len(extra_entries)} legenda(s) extra(s) adicionada(s) na timeline.")
+            else:
+                self.extra_text_status.setText("Nenhuma legenda extra adicionada.")
+
         active = []
         if anime:
             active.append(f"legenda anime ({self.anime_subtitle_position_combo.currentText()})")
         if narrator_sub:
-            active.append(f"legenda narrador ({self.narrator_subtitle_position_combo.currentText()})")
+            label = f"legenda narrador ({self.narrator_subtitle_position_combo.currentText()})"
+            if dynamic:
+                label += " dinâmica REAL OK" if self._clip and self._find_narration_sync_path(self._clip) else " dinâmica sem sync real"
+            active.append(label)
         if narration_audio:
             active.append(f"narração áudio {self.narration_volume_spin.value():.2f}x")
-        if extra and self.extra_text_edit.text().strip():
-            active.append("texto extra")
-        if watermark and self.watermark_text_edit.text().strip():
+        if extra:
+            active.append(f"{len(extra_entries)} legenda(s) extra(s)")
+        if watermark and hasattr(self, "watermark_text_edit") and self.watermark_text_edit.text().strip():
             active.append(f"marca d'água {self.watermark_text_edit.text().strip()}")
+        if watermark and logo_path:
+            active.append("logo do canal")
         summary = ", ".join(active) if active else "nenhuma camada extra"
         if hasattr(self, "preview_layers_label") and not getattr(self, "_preview_dirty", True):
-            self.preview_layers_label.setText(
-                "Prévia aplicada atualizada. Camadas ativas: " + summary + "."
-            )
+            self.preview_layers_label.setText("Prévia aplicada atualizada. Camadas ativas: " + summary + ".")
         elif hasattr(self, "preview_layers_label") and self._clip:
-            self.preview_layers_label.setText(
-                "Prévia desatualizada. Camadas ativas para renderizar: " + summary + ". Clique em Atualizar prévia aplicada."
-            )
+            self.preview_layers_label.setText("Prévia desatualizada. Camadas ativas para renderizar: " + summary + ". Clique em Atualizar prévia aplicada.")
         self._sync_preview_audio()
         self._mark_preview_dirty("camadas alteradas")
 
@@ -1993,22 +2441,43 @@ class MontageEditorView(QWidget):
         subtitles = metadata.get("subtitles_ptbr") if isinstance(metadata.get("subtitles_ptbr"), dict) else {}
         candidates.extend([
             clip.get("subtitle_ass_path"), clip.get("ass_path"), clip.get("subtitle_path"),
+            clip.get("subtitle_srt_path"), clip.get("srt_path"),
             metadata.get("subtitle_ass_path"), metadata.get("ass_path"), metadata.get("subtitle_path"),
+            metadata.get("subtitle_srt_path"), metadata.get("srt_path"),
             subtitles.get("ass_path") if isinstance(subtitles, dict) else None,
+            subtitles.get("srt_path") if isinstance(subtitles, dict) else None,
         ])
         output_path = Path(str(clip.get("output_path") or ""))
         if output_path.name:
             candidates.extend([
                 output_path.with_name(f"{output_path.stem}.pt-BR.ass"),
                 output_path.with_name(f"{output_path.stem}.ass"),
+                output_path.with_name(f"{output_path.stem}.pt-BR.srt"),
+                output_path.with_name(f"{output_path.stem}.srt"),
             ])
+        # Preferir ASS quando estiver limpo; se não, o serviço converte/limpa SRT/VTT.
+        fallback: Optional[Path] = None
         for value in candidates:
             if not value:
                 continue
             path = Path(str(value))
-            if path.exists() and path.suffix.lower() == ".ass":
+            if not path.exists() or path.suffix.lower() not in {".ass", ".srt", ".vtt"}:
+                continue
+            if path.suffix.lower() == ".ass":
+                try:
+                    raw = path.read_text(encoding="utf-8", errors="replace")
+                    if "-->" not in raw:
+                        return path
+                    # ASS contaminado por SRT: segura como fallback e continua procurando SRT irmão.
+                    fallback = path
+                    sibling = path.with_suffix(".srt")
+                    if sibling.exists():
+                        return sibling
+                except Exception:
+                    fallback = path
+            else:
                 return path
-        return None
+        return fallback
 
     def _find_narration_audio_path(self, clip: Dict[str, Any]) -> Optional[Path]:
         metadata = self._read_clip_metadata(clip)
@@ -2031,6 +2500,52 @@ class MontageEditorView(QWidget):
                 return path
         return None
 
+    def _find_narration_sync_path(self, clip: Dict[str, Any]) -> Optional[Path]:
+        metadata = self._read_clip_metadata(clip)
+        candidates = [
+            clip.get("narration_sync_path"),
+            metadata.get("narration_sync_path"),
+        ]
+        audio = self._find_narration_audio_path(clip)
+        if audio:
+            candidates.append(Path(audio).with_suffix(".sync.json"))
+        for value in candidates:
+            if not value:
+                continue
+            path = Path(str(value))
+            if path.exists() and path.suffix.lower() == ".json" and self._is_real_narration_sync(path):
+                return path
+        return None
+
+    def _is_real_narration_sync(self, path: Path) -> bool:
+        """Aceita somente sync real por palavra. Sync estimado antigo é ignorado."""
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if not isinstance(payload, dict) or payload.get("estimated"):
+            return False
+        words = payload.get("words")
+        if not isinstance(words, list) or len(words) < 3:
+            return False
+        valid = 0
+        last_start = -1.0
+        for item in words:
+            if not isinstance(item, dict):
+                continue
+            word = str(item.get("word") or item.get("text") or "").strip()
+            if not word:
+                continue
+            try:
+                start = float(item.get("start") or 0.0)
+                end = float(item.get("end") or start + float(item.get("duration") or 0.0))
+            except Exception:
+                continue
+            if end > start and start >= last_start - 0.05:
+                valid += 1
+                last_start = start
+        return valid >= 3
+
     def _narration_script_for_clip(self, clip: Dict[str, Any]) -> str:
         metadata = self._read_clip_metadata(clip)
         package = metadata.get("narration_package") if isinstance(metadata.get("narration_package"), dict) else {}
@@ -2047,13 +2562,13 @@ class MontageEditorView(QWidget):
         mode = "vídeo inteiro"
         if hasattr(self, "narrator_subtitle_duration_combo"):
             mode = self.narrator_subtitle_duration_combo.currentText().lower()
-        if "narra" in mode or "audio" in mode or "áudio" in mode:
+        if "narra" in mode or "audio" in mode or "áudio" in mode or "seguir" in mode:
             audio = self._find_narration_audio_path(clip)
             if audio:
                 audio_duration = self.service.probe_duration(audio)
                 if audio_duration > 0:
                     return audio_duration
-        # Padrão TEDVHS: legenda do narrador distribuída pelo clipe inteiro.
+        # Padrão TEDVHS: quando não há MP3, distribui pelo clipe inteiro.
         return self._clip_duration(clip)
 
     def _clip_duration(self, clip: Dict[str, Any]) -> float:
@@ -2142,6 +2657,34 @@ class MontageEditorView(QWidget):
     @staticmethod
     def _safe_output_stem(value: str) -> str:
         return LayeredEditorService.sanitize_name(value)
+
+    @staticmethod
+    def _time_to_seconds(value: str) -> float:
+        text = str(value or "").strip().replace(",", ".")
+        if not text:
+            return 0.0
+        try:
+            if ":" not in text:
+                return max(0.0, float(text))
+            parts = [float(part or 0) for part in text.split(":")]
+            if len(parts) == 3:
+                hours, minutes, seconds = parts
+            elif len(parts) == 2:
+                hours = 0.0
+                minutes, seconds = parts
+            else:
+                return max(0.0, float(parts[0]))
+            return max(0.0, hours * 3600 + minutes * 60 + seconds)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _format_timecode(seconds: float) -> str:
+        seconds = max(0.0, float(seconds or 0.0))
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        sec = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{sec:02d}"
 
     @staticmethod
     def _format_time(seconds: float) -> str:
