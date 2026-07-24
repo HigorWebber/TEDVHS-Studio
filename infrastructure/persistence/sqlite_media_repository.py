@@ -1140,19 +1140,87 @@ class SQLiteMediaRepository:
                 end = start + 0.25
             return start, end
 
-        # A ordem recebida vem da tabela e deve ser preservada exatamente.
-        segments = []
-        for scene in clean_scenes:
-            start, end = effective_bounds(scene)
-            segments.append({
+        def segments_for_scene(
+            scene: Dict[str, Any],
+        ) -> list[Dict[str, Any]]:
+            """Expandir cenas e clipes juntados nos seus cortes reais."""
+            raw_segments = scene.get("segments_json")
+
+            if raw_segments:
+                try:
+                    parsed_segments = (
+                        json.loads(raw_segments)
+                        if isinstance(raw_segments, str)
+                        else raw_segments
+                    )
+                except (TypeError, ValueError):
+                    parsed_segments = None
+
+                if isinstance(parsed_segments, list):
+                    expanded: list[Dict[str, Any]] = []
+
+                    for raw_segment in parsed_segments:
+                        if not isinstance(raw_segment, dict):
+                            continue
+
+                        try:
+                            segment_start = float(
+                                raw_segment.get("start_seconds") or 0.0
+                            )
+                            segment_end = float(
+                                raw_segment.get("end_seconds")
+                                or segment_start
+                            )
+                        except (TypeError, ValueError):
+                            continue
+
+                        if segment_end <= segment_start:
+                            continue
+
+                        expanded.append({
+                            "scene_id": (
+                                raw_segment.get("scene_id")
+                                or scene.get("id")
+                            ),
+                            "scene_number": (
+                                raw_segment.get("scene_number")
+                                or scene.get("scene_number")
+                            ),
+                            "start_seconds": segment_start,
+                            "end_seconds": segment_end,
+                            "duration_seconds": max(
+                                segment_end - segment_start,
+                                0.0,
+                            ),
+                        })
+
+                    if expanded:
+                        return expanded
+
+            scene_start, scene_end = effective_bounds(scene)
+
+            return [{
                 "scene_id": scene.get("id"),
                 "scene_number": scene.get("scene_number"),
-                "start_seconds": start,
-                "end_seconds": end,
-                "duration_seconds": max(end - start, 0.0),
-            })
+                "start_seconds": scene_start,
+                "end_seconds": scene_end,
+                "duration_seconds": max(
+                    scene_end - scene_start,
+                    0.0,
+                ),
+            }]
 
-        total_duration = sum(float(segment["duration_seconds"]) for segment in segments)
+        # Preservar a ordem manual e expandir clipes ja juntados.
+        segments: list[Dict[str, Any]] = []
+
+        for scene in clean_scenes:
+            segments.extend(segments_for_scene(scene))
+
+        total_duration = sum(
+            float(segment["duration_seconds"])
+            for segment in segments
+        )
+
         start_seconds = min(float(segment["start_seconds"]) for segment in segments)
         end_seconds = max(float(segment["end_seconds"]) for segment in segments)
         source_ids = [scene.get("id") for scene in clean_scenes]
