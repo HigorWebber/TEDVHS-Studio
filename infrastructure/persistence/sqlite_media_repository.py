@@ -62,13 +62,46 @@ class SQLiteMediaRepository:
             raise
 
     def _ensure_import_session_columns(self) -> None:
-        """Adicionar colunas novas em bancos antigos."""
-        columns = {row[1] for row in self.db.execute("PRAGMA table_info(import_sessions)").fetchall()}
+        """Criar tabela de sessões e adicionar colunas novas em bancos antigos."""
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS import_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT UNIQUE NOT NULL,
+                folder_path TEXT NOT NULL,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                status TEXT DEFAULT 'IN_PROGRESS',
+                total_files_found INTEGER DEFAULT 0,
+                total_files_valid INTEGER DEFAULT 0,
+                total_files_imported INTEGER DEFAULT 0,
+                total_files_duplicate INTEGER DEFAULT 0,
+                total_files_failed INTEGER DEFAULT 0,
+                total_duration_seconds REAL DEFAULT 0,
+                total_size_bytes INTEGER DEFAULT 0
+            )"""
+        )
+
+        columns = {
+            row[1]
+            for row in self.db.execute(
+                "PRAGMA table_info(import_sessions)"
+            ).fetchall()
+        }
         if "total_files_duplicate" not in columns:
             self.db.execute(
-                "ALTER TABLE import_sessions ADD COLUMN total_files_duplicate INTEGER DEFAULT 0"
+                "ALTER TABLE import_sessions "
+                "ADD COLUMN total_files_duplicate INTEGER DEFAULT 0"
             )
-            self.db.commit()
+
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_status "
+            "ON import_sessions(status)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_started_at "
+            "ON import_sessions(started_at)"
+        )
+        self.db.commit()
 
     def _ensure_library_folder_schema(self) -> None:
         """Criar estrutura simples de pastas e temporadas internas da biblioteca."""
@@ -213,6 +246,7 @@ class SQLiteMediaRepository:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 media_id INTEGER NOT NULL,
                 scene_number INTEGER NOT NULL,
+                sort_order INTEGER,
                 start_seconds REAL NOT NULL,
                 end_seconds REAL NOT NULL,
                 duration_seconds REAL NOT NULL,
@@ -249,6 +283,7 @@ class SQLiteMediaRepository:
             "source_scene_ids": "ALTER TABLE media_scenes ADD COLUMN source_scene_ids TEXT",
             "segments_json": "ALTER TABLE media_scenes ADD COLUMN segments_json TEXT",
             "display_name": "ALTER TABLE media_scenes ADD COLUMN display_name TEXT",
+            "sort_order": "ALTER TABLE media_scenes ADD COLUMN sort_order INTEGER",
             "description": "ALTER TABLE media_scenes ADD COLUMN description TEXT",
             "tags": "ALTER TABLE media_scenes ADD COLUMN tags TEXT",
             "scene_type": "ALTER TABLE media_scenes ADD COLUMN scene_type TEXT DEFAULT 'Geral'",
@@ -262,8 +297,15 @@ class SQLiteMediaRepository:
             if column not in columns:
                 self.db.execute(sql)
 
+        # Bancos antigos passam a usar a ordem cronológica atual como ordem inicial.
+        self.db.execute(
+            "UPDATE media_scenes SET sort_order = scene_number "
+            "WHERE sort_order IS NULL OR sort_order <= 0"
+        )
+
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_media_id ON media_scenes(media_id)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_number ON media_scenes(media_id, scene_number)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_sort_order ON media_scenes(media_id, sort_order)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_type ON media_scenes(scene_type)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_media_scenes_favorite ON media_scenes(is_favorite)")
         self.db.commit()
@@ -960,15 +1002,16 @@ class SQLiteMediaRepository:
         for index, scene in enumerate(scenes, start=1):
             self.db.execute(
                 """INSERT INTO media_scenes (
-                    media_id, scene_number, start_seconds, end_seconds,
+                    media_id, scene_number, sort_order, start_seconds, end_seconds,
                     duration_seconds, custom_start_seconds, custom_end_seconds,
                     custom_duration_seconds, detection_threshold, status,
                     description, tags, scene_type, thumbnail_path,
                     analysis_frames_json, ai_status, is_favorite, notes, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     media_id_value,
                     int(scene.get("scene_number") or index),
+                    int(scene.get("sort_order") or index),
                     float(scene.get("start_seconds") or 0.0),
                     float(scene.get("end_seconds") or 0.0),
                     float(scene.get("duration_seconds") or 0.0),
@@ -1000,7 +1043,7 @@ class SQLiteMediaRepository:
         """Listar cenas detectadas de uma mídia."""
         media_id_value = self._media_id_value(media_id)
         cursor = self.db.execute(
-            """SELECT id, media_id, scene_number, start_seconds, end_seconds,
+            """SELECT id, media_id, scene_number, sort_order, start_seconds, end_seconds,
                       duration_seconds, custom_start_seconds, custom_end_seconds,
                       custom_duration_seconds, is_merged, source_scene_ids,
                       segments_json, display_name, detection_threshold, status,
@@ -1009,11 +1052,11 @@ class SQLiteMediaRepository:
                       notes, created_at, updated_at
                FROM media_scenes
                WHERE media_id = ?
-               ORDER BY scene_number ASC""",
+               ORDER BY COALESCE(sort_order, scene_number) ASC, scene_number ASC, id ASC""",
             (media_id_value,),
         )
         columns = [
-            "id", "media_id", "scene_number", "start_seconds", "end_seconds",
+            "id", "media_id", "scene_number", "sort_order", "start_seconds", "end_seconds",
             "duration_seconds", "custom_start_seconds", "custom_end_seconds",
             "custom_duration_seconds", "is_merged", "source_scene_ids",
             "segments_json", "display_name", "detection_threshold", "status", "description",
@@ -1021,6 +1064,55 @@ class SQLiteMediaRepository:
             "ai_status", "is_favorite", "notes", "created_at", "updated_at",
         ]
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+    def reorder_scenes(self, media_id: Any, ordered_scene_ids: List[Any]) -> int:
+        """Persistir a ordem manual completa das cenas/clipes de uma mídia.
+
+        A lista recebida precisa conter exatamente os IDs atualmente salvos para
+        o episódio. Isso evita sobrescrever uma lista desatualizada ou perder itens.
+        """
+        media_id_value = self._media_id_value(media_id)
+        clean_ids: list[int] = []
+        seen: set[int] = set()
+        for raw_id in ordered_scene_ids:
+            try:
+                scene_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if scene_id not in seen:
+                seen.add(scene_id)
+                clean_ids.append(scene_id)
+
+        current_rows = self.db.execute(
+            "SELECT id FROM media_scenes WHERE media_id = ?",
+            (media_id_value,),
+        ).fetchall()
+        current_ids = {int(row[0]) for row in current_rows}
+        if not current_ids:
+            return 0
+        if set(clean_ids) != current_ids or len(clean_ids) != len(current_ids):
+            raise ValueError(
+                "A lista de cenas mudou enquanto a ordem era editada. Recarregue o episódio e tente novamente."
+            )
+
+        case_parts: list[str] = []
+        params: list[Any] = []
+        for position, scene_id in enumerate(clean_ids, start=1):
+            case_parts.append("WHEN ? THEN ?")
+            params.extend((scene_id, position))
+
+        placeholders = ", ".join("?" for _ in clean_ids)
+        params.extend((datetime.utcnow().isoformat(), media_id_value, *clean_ids))
+        cursor = self.db.execute(
+            f"""UPDATE media_scenes
+                SET sort_order = CASE id {' '.join(case_parts)} END,
+                    updated_at = ?
+                WHERE media_id = ? AND id IN ({placeholders})""",
+            tuple(params),
+        )
+        self.db.commit()
+        return int(cursor.rowcount)
 
 
     def create_merged_scene(self, media_id: Any, source_scenes: List[Dict[str, Any]], display_name: Optional[str] = None) -> Dict[str, Any]:
@@ -1048,7 +1140,7 @@ class SQLiteMediaRepository:
                 end = start + 0.25
             return start, end
 
-        clean_scenes.sort(key=lambda item: effective_bounds(item)[0])
+        # A ordem recebida vem da tabela e deve ser preservada exatamente.
         segments = []
         for scene in clean_scenes:
             start, end = effective_bounds(scene)
@@ -1061,15 +1153,18 @@ class SQLiteMediaRepository:
             })
 
         total_duration = sum(float(segment["duration_seconds"]) for segment in segments)
-        start_seconds = float(segments[0]["start_seconds"])
-        end_seconds = float(segments[-1]["end_seconds"])
+        start_seconds = min(float(segment["start_seconds"]) for segment in segments)
+        end_seconds = max(float(segment["end_seconds"]) for segment in segments)
         source_ids = [scene.get("id") for scene in clean_scenes]
 
         row = self.db.execute(
-            "SELECT COALESCE(MAX(scene_number), 0) + 1 FROM media_scenes WHERE media_id = ?",
+            """SELECT COALESCE(MAX(scene_number), 0) + 1,
+                      COALESCE(MAX(COALESCE(sort_order, scene_number)), 0) + 1
+               FROM media_scenes WHERE media_id = ?""",
             (media_id_value,),
         ).fetchone()
         scene_number = int(row[0] if row else 1)
+        sort_order = int(row[1] if row else scene_number)
         display_name = (display_name or f"Clipe {scene_number:03d} (juntado)").strip() or f"Clipe {scene_number:03d} (juntado)"
 
         tag_values: list[str] = []
@@ -1089,16 +1184,17 @@ class SQLiteMediaRepository:
 
         self.db.execute(
             """INSERT INTO media_scenes (
-                media_id, scene_number, start_seconds, end_seconds,
+                media_id, scene_number, sort_order, start_seconds, end_seconds,
                 duration_seconds, custom_start_seconds, custom_end_seconds,
                 custom_duration_seconds, is_merged, source_scene_ids,
                 segments_json, display_name, detection_threshold, status,
                 description, tags, scene_type, thumbnail_path,
                 analysis_frames_json, ai_status, is_favorite, notes, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 media_id_value,
                 scene_number,
+                sort_order,
                 start_seconds,
                 end_seconds,
                 total_duration,
@@ -1154,10 +1250,13 @@ class SQLiteMediaRepository:
         source_name = source_scene.get("display_name") or f"Cena {int(source_scene.get('scene_number') or 0):03d}"
 
         row = self.db.execute(
-            "SELECT COALESCE(MAX(scene_number), 0) + 1 FROM media_scenes WHERE media_id = ?",
+            """SELECT COALESCE(MAX(scene_number), 0) + 1,
+                      COALESCE(MAX(COALESCE(sort_order, scene_number)), 0) + 1
+               FROM media_scenes WHERE media_id = ?""",
             (media_id_value,),
         ).fetchone()
         scene_number = int(row[0] if row else 1)
+        sort_order = int(row[1] if row else scene_number)
         display_name = (display_name or f"{source_name} - corte").strip() or f"{source_name} - corte"
         duration = max(end - start, 0.0)
 
@@ -1177,16 +1276,17 @@ class SQLiteMediaRepository:
 
         self.db.execute(
             """INSERT INTO media_scenes (
-                media_id, scene_number, start_seconds, end_seconds,
+                media_id, scene_number, sort_order, start_seconds, end_seconds,
                 duration_seconds, custom_start_seconds, custom_end_seconds,
                 custom_duration_seconds, is_merged, source_scene_ids,
                 segments_json, display_name, detection_threshold, status,
                 description, tags, scene_type, thumbnail_path,
                 analysis_frames_json, ai_status, is_favorite, notes, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 media_id_value,
                 scene_number,
+                sort_order,
                 start,
                 end,
                 duration,
@@ -1228,12 +1328,30 @@ class SQLiteMediaRepository:
         ).fetchone()
         return int(row[0] if row else 0)
 
+    def delete_scenes(self, scene_ids: List[Any]) -> int:
+        """Excluir uma ou mais cenas em uma única transação."""
+        normalized_ids: List[int] = []
+        seen: set[int] = set()
+        for scene_id in scene_ids or []:
+            scene_id_value = scene_id.value if hasattr(scene_id, "value") else int(scene_id)
+            if scene_id_value not in seen:
+                seen.add(scene_id_value)
+                normalized_ids.append(scene_id_value)
+
+        if not normalized_ids:
+            return 0
+
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        cursor = self.db.execute(
+            f"DELETE FROM media_scenes WHERE id IN ({placeholders})",
+            tuple(normalized_ids),
+        )
+        self.db.commit()
+        return max(int(cursor.rowcount), 0)
+
     def delete_scene(self, scene_id: Any) -> bool:
         """Excluir uma cena detectada."""
-        scene_id_value = scene_id.value if hasattr(scene_id, "value") else int(scene_id)
-        cursor = self.db.execute("DELETE FROM media_scenes WHERE id = ?", (scene_id_value,))
-        self.db.commit()
-        return cursor.rowcount > 0
+        return self.delete_scenes([scene_id]) > 0
 
 
     def update_scene_visual_catalog(

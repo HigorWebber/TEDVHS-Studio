@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal, QItemSelectionModel
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -580,6 +580,49 @@ class SceneDetectionView(QWidget):
         search_layout.addWidget(search_hint)
         layout.addWidget(search_group)
 
+        scene_actions = QHBoxLayout()
+
+        self.move_scene_up_btn = QPushButton("↑ Subir")
+        self.move_scene_up_btn.setEnabled(False)
+        self.move_scene_up_btn.setToolTip(
+            "Move as cenas/clipes selecionados uma posição para cima. "
+            "A ordem salva será usada ao juntar, pré-visualizar e exportar."
+        )
+        self.move_scene_up_btn.clicked.connect(lambda: self._move_selected_scenes(-1))
+        scene_actions.addWidget(self.move_scene_up_btn)
+
+        self.move_scene_down_btn = QPushButton("↓ Descer")
+        self.move_scene_down_btn.setEnabled(False)
+        self.move_scene_down_btn.setToolTip(
+            "Move as cenas/clipes selecionados uma posição para baixo. "
+            "Seleções múltiplas são movidas juntas."
+        )
+        self.move_scene_down_btn.clicked.connect(lambda: self._move_selected_scenes(1))
+        scene_actions.addWidget(self.move_scene_down_btn)
+
+        self.move_scene_after_btn = QPushButton("Mover após…")
+        self.move_scene_after_btn.setEnabled(False)
+        self.move_scene_after_btn.setToolTip(
+            "Escolha depois de qual cena/clipe os itens selecionados devem ficar."
+        )
+        self.move_scene_after_btn.clicked.connect(self._move_selected_scenes_after)
+        scene_actions.addWidget(self.move_scene_after_btn)
+
+        self.delete_selected_btn = QPushButton("Excluir selecionadas")
+        self.delete_selected_btn.setEnabled(False)
+        self.delete_selected_btn.setToolTip(
+            "Remove somente as cenas/clipes selecionados da lista. "
+            "O episódio original e os MP4s já exportados não são apagados."
+        )
+        self.delete_selected_btn.setStyleSheet(
+            "QPushButton { color: #ffb4b4; }"
+            "QPushButton:disabled { color: #777777; }"
+        )
+        self.delete_selected_btn.clicked.connect(self._on_delete_selected_clicked)
+        scene_actions.addWidget(self.delete_selected_btn)
+        scene_actions.addStretch()
+        layout.addLayout(scene_actions)
+
         self.table = QTableWidget()
         self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
@@ -590,6 +633,9 @@ class SceneDetectionView(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.itemSelectionChanged.connect(self._on_scene_selected)
         self.table.doubleClicked.connect(lambda *_: self._play_selected_scene())
+        self.delete_scene_shortcut = QShortcut(QKeySequence.Delete, self.table)
+        self.delete_scene_shortcut.setContext(Qt.WidgetShortcut)
+        self.delete_scene_shortcut.activated.connect(self._on_delete_selected_clicked)
         self.table.setIconSize(QPixmap(96, 54).size())
         self.table.setWordWrap(False)
         self.table.setAlternatingRowColors(True)
@@ -1467,6 +1513,9 @@ class SceneDetectionView(QWidget):
         if hasattr(self, "test_ollama_btn"):
             self.test_ollama_btn.setEnabled(not busy)
         self.clear_btn.setEnabled(not busy)
+        if hasattr(self, "delete_selected_btn"):
+            self.delete_selected_btn.setEnabled(not busy and bool(self._selected_rows()))
+        self._update_reorder_buttons()
         self.refresh_btn.setEnabled(not busy)
         self.folder_combo.setEnabled(not busy)
         self.season_combo.setEnabled(not busy)
@@ -1498,6 +1547,9 @@ class SceneDetectionView(QWidget):
         busy = self._active_thread is not None
         self.detect_btn.setEnabled(has_media and not busy)
         self.clear_btn.setEnabled(has_media and not busy)
+        if hasattr(self, "delete_selected_btn"):
+            self.delete_selected_btn.setEnabled(not busy and bool(self._selected_rows()))
+        self._update_reorder_buttons()
         self.catalog_selected_btn.setEnabled(not busy)
         self.catalog_all_btn.setEnabled(not busy)
         if hasattr(self, "generate_ai_btn"):
@@ -1510,6 +1562,268 @@ class SceneDetectionView(QWidget):
             self.classify_episode_btn.setEnabled(has_media and not busy)
         if hasattr(self, "test_ollama_btn"):
             self.test_ollama_btn.setEnabled(not busy)
+
+    def _update_reorder_buttons(self) -> None:
+        """Atualizar disponibilidade dos controles de ordem manual."""
+        if not hasattr(self, "move_scene_up_btn"):
+            return
+        rows = self._selected_rows()
+        busy = self._active_thread is not None
+        has_selection = bool(rows)
+        row_count = self.table.rowCount() if hasattr(self, "table") else 0
+        self.move_scene_up_btn.setEnabled(not busy and has_selection and min(rows, default=0) > 0)
+        self.move_scene_down_btn.setEnabled(
+            not busy and has_selection and max(rows, default=-1) < row_count - 1
+        )
+        self.move_scene_after_btn.setEnabled(
+            not busy and has_selection and row_count > len(rows)
+        )
+
+    def _scene_ids_in_table_order(self) -> list[int]:
+        ordered_ids: list[int] = []
+        for row in range(self.table.rowCount()):
+            scene = self._scenes_by_row.get(row)
+            if not scene:
+                continue
+            try:
+                ordered_ids.append(int(scene.get("id")))
+            except (TypeError, ValueError):
+                continue
+        return ordered_ids
+
+    def _select_scenes_by_ids(self, scene_ids: list[int]) -> None:
+        wanted = {int(scene_id) for scene_id in scene_ids}
+        self.table.clearSelection()
+        selection_model = self.table.selectionModel()
+        if selection_model is None:
+            return
+        first_item = None
+        for row, scene in self._scenes_by_row.items():
+            try:
+                scene_id = int(scene.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if scene_id not in wanted:
+                continue
+            index = self.table.model().index(row, 0)
+            selection_model.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+            if first_item is None:
+                first_item = self.table.item(row, 1)
+        if first_item is not None:
+            self.table.scrollToItem(first_item)
+
+    def _persist_scene_order(self, ordered_ids: list[int], selected_ids: list[int], message: str) -> None:
+        media = self._selected_media_obj()
+        if not media:
+            return
+        try:
+            media_db_id = self._require_database_media_id(media, "reordenar cenas")
+            self.repository.reorder_scenes(media_db_id, ordered_ids)
+            self._load_scenes_for_selected_media(select_first=False)
+            self._select_scenes_by_ids(selected_ids)
+            self.status_label.setText(message)
+        except Exception as exc:
+            logger.error("Erro ao reordenar cenas: %s", exc, exc_info=True)
+            QMessageBox.critical(self, "Erro ao reordenar cenas", str(exc))
+        finally:
+            self._update_action_buttons()
+
+    def _move_selected_scenes(self, direction: int) -> None:
+        """Mover a seleção uma posição, tratando múltiplos itens como um bloco."""
+        if self._active_thread is not None:
+            return
+        rows = self._selected_rows()
+        if not rows:
+            return
+        ordered_ids = self._scene_ids_in_table_order()
+        selected_ids = [
+            int(self._scenes_by_row[row]["id"])
+            for row in rows
+            if row in self._scenes_by_row and self._scenes_by_row[row].get("id") is not None
+        ]
+        if not selected_ids:
+            return
+
+        selected_set = set(selected_ids)
+        remaining = [scene_id for scene_id in ordered_ids if scene_id not in selected_set]
+        current_start = min(rows)
+        if direction < 0:
+            target_index = max(0, current_start - 1)
+            action = "para cima"
+        else:
+            target_index = min(len(remaining), current_start + 1)
+            action = "para baixo"
+
+        reordered = remaining[:target_index] + selected_ids + remaining[target_index:]
+        if reordered == ordered_ids:
+            return
+        self._persist_scene_order(
+            reordered,
+            selected_ids,
+            f"{len(selected_ids)} cena(s)/clipe(s) movido(s) {action}.",
+        )
+
+    def _move_selected_scenes_after(self) -> None:
+        """Mover a seleção para depois de um item escolhido pelo usuário."""
+        if self._active_thread is not None:
+            return
+        rows = self._selected_rows()
+        if not rows:
+            return
+
+        selected_ids = [
+            int(self._scenes_by_row[row]["id"])
+            for row in rows
+            if row in self._scenes_by_row and self._scenes_by_row[row].get("id") is not None
+        ]
+        selected_set = set(selected_ids)
+        ordered_ids = self._scene_ids_in_table_order()
+
+        choices: list[str] = []
+        choice_ids: list[int] = []
+        for row in range(self.table.rowCount()):
+            scene = self._scenes_by_row.get(row)
+            if not scene:
+                continue
+            try:
+                scene_id = int(scene.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if scene_id in selected_set:
+                continue
+            name = scene.get("display_name") or f"Cena {int(scene.get('scene_number') or 0):03d}"
+            choices.append(f"{row + 1:03d} — {name}")
+            choice_ids.append(scene_id)
+
+        if not choices:
+            return
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Mover cenas/clipes",
+            "Colocar a seleção depois de:",
+            choices,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        target_id = choice_ids[choices.index(choice)]
+        remaining = [scene_id for scene_id in ordered_ids if scene_id not in selected_set]
+        target_index = remaining.index(target_id) + 1
+        reordered = remaining[:target_index] + selected_ids + remaining[target_index:]
+        if reordered == ordered_ids:
+            return
+
+        target_scene = next(
+            (scene for scene in self._scenes_by_row.values() if int(scene.get("id") or 0) == target_id),
+            None,
+        )
+        target_name = (target_scene or {}).get("display_name") or (
+            f"Cena {int((target_scene or {}).get('scene_number') or 0):03d}"
+        )
+        self._persist_scene_order(
+            reordered,
+            selected_ids,
+            f"{len(selected_ids)} cena(s)/clipe(s) movido(s) após {target_name}.",
+        )
+
+    def _on_delete_selected_clicked(self) -> None:
+        """Excluir somente as cenas/clipes selecionados, preservando o episódio original."""
+        if self._active_thread is not None:
+            QMessageBox.information(
+                self,
+                "Operação em andamento",
+                "Aguarde a operação atual terminar ou clique em Cancelar antes de excluir cenas.",
+            )
+            return
+
+        selected_rows = self._selected_rows()
+        scenes = [self._scenes_by_row[row] for row in selected_rows if row in self._scenes_by_row]
+        if not scenes and self._selected_scene:
+            scenes = [self._selected_scene]
+        if not scenes:
+            QMessageBox.information(self, "Excluir cenas", "Selecione uma ou mais cenas/clipes na lista.")
+            return
+
+        unique_scenes: list[Dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for scene in scenes:
+            try:
+                scene_id = int(scene.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if scene_id not in seen_ids:
+                seen_ids.add(scene_id)
+                unique_scenes.append(scene)
+
+        if not unique_scenes:
+            QMessageBox.warning(self, "Excluir cenas", "As cenas selecionadas não possuem identificadores válidos.")
+            return
+
+        names = [
+            str(scene.get("display_name") or f"Cena {int(scene.get('scene_number') or 0):03d}")
+            for scene in unique_scenes
+        ]
+        if len(unique_scenes) == 1:
+            title = "Excluir cena?"
+            selection_text = names[0]
+        else:
+            title = f"Excluir {len(unique_scenes)} cenas?"
+            preview_names = "\n".join(f"• {name}" for name in names[:8])
+            remaining = len(names) - 8
+            if remaining > 0:
+                preview_names += f"\n• ... e mais {remaining}"
+            selection_text = preview_names
+
+        reply = QMessageBox.question(
+            self,
+            title,
+            f"{selection_text}\n\n"
+            "As cenas/clipes serão removidos desta lista e do banco do projeto.\n"
+            "O episódio original e os MP4s já exportados não serão apagados.\n\n"
+            "Deseja continuar?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        deleted_ids = {int(scene["id"]) for scene in unique_scenes}
+        anchor_row = min(selected_rows) if selected_rows else 0
+        remaining_items = [
+            (row, scene)
+            for row, scene in sorted(self._scenes_by_row.items())
+            if int(scene.get("id") or 0) not in deleted_ids
+        ]
+        next_scene_id = None
+        for row, scene in remaining_items:
+            if row >= anchor_row:
+                next_scene_id = scene.get("id")
+                break
+        if next_scene_id is None and remaining_items:
+            next_scene_id = remaining_items[-1][1].get("id")
+
+        try:
+            self._stop_preview()
+            removed = self.repository.delete_scenes(sorted(deleted_ids))
+            self._selected_scene = None
+            self._clear_detail_panel()
+            self._load_scenes_for_selected_media(
+                select_scene_id=next_scene_id,
+                select_first=next_scene_id is None,
+            )
+            self.status_label.setText(f"{removed} cena(s)/clipe(s) excluída(s).")
+            if removed != len(deleted_ids):
+                QMessageBox.warning(
+                    self,
+                    "Exclusão parcial",
+                    f"Foram solicitadas {len(deleted_ids)} exclusões, mas o banco removeu {removed} item(ns).",
+                )
+        except Exception as exc:
+            logger.error("Erro ao excluir cenas selecionadas: %s", exc, exc_info=True)
+            QMessageBox.critical(self, "Erro ao excluir cenas", str(exc))
+        finally:
+            self._update_action_buttons()
 
     def _on_clear_clicked(self) -> None:
         media = self._selected_media_obj()
@@ -1565,6 +1879,7 @@ class SceneDetectionView(QWidget):
         self.table.setRowCount(len(scenes))
         for row, scene in enumerate(scenes):
             self._scenes_by_row[row] = scene
+            self.table.setVerticalHeaderItem(row, QTableWidgetItem(str(row + 1)))
             self.table.setRowHeight(row, 64)
 
             thumb_item = QTableWidgetItem()
@@ -1813,6 +2128,9 @@ class SceneDetectionView(QWidget):
 
     def _on_scene_selected(self) -> None:
         selected_rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if hasattr(self, "delete_selected_btn"):
+            self.delete_selected_btn.setEnabled(self._active_thread is None and bool(selected_rows))
+        self._update_reorder_buttons()
         if not selected_rows:
             self._selected_scene = None
             self._clear_detail_panel()
@@ -2237,7 +2555,6 @@ class SceneDetectionView(QWidget):
             return
 
         scenes = [self._scenes_by_row[row] for row in selected_rows if row in self._scenes_by_row]
-        scenes.sort(key=lambda item: float(item.get("start_seconds") or 0.0))
 
         default_name = f"Clipe juntado {len(scenes)} cenas"
         clip_name, ok_name = QInputDialog.getText(
@@ -2695,7 +3012,7 @@ class SceneDetectionView(QWidget):
         if len(scenes) == 1:
             segments_ms = self._segments_for_scene(scenes[0])
         else:
-            scenes = sorted(scenes, key=lambda item: float(item.get("start_seconds") or 0.0))
+            # A seleção já vem na ordem manual exibida na tabela.
             segments_ms = []
             for scene in scenes:
                 segments_ms.extend(self._segments_for_scene(scene))
